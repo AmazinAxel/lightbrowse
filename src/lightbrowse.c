@@ -23,7 +23,16 @@ static const char* CSS =
     ".modal entry { min-width: 280px; }"
     ".modal label { margin: 3px 0; padding: 6px; }"
     ".modal .selected { background: #81A1C1; color: #ECEFF4; outline: 2px #5E81AC; border-radius: 4px; }"
-    ".findbar { background: @theme_bg_color; color: @theme_fg_color; border: 1px solid #5e81ac; border-radius: 8px; padding: 4px; margin-bottom: 12px; }";
+    ".findbar { background: @theme_bg_color; color: @theme_fg_color; border: 1px solid #5e81ac; border-radius: 8px; padding: 4px; margin-bottom: 12px; }"
+    /* Chrome colours follow light/dark via a root class (lb-dark / lb-light) set
+     * in apply_system_theme, so we never reload the system theme (which stalls the
+     * webview's color-scheme). Nord: polar night #2e3440/#3b4252, snow #eceff4/#e5e9f0. */
+    "window.lb-dark .tabbar { background: #3b4252; }"
+    "window.lb-light .tabbar { background: #e5e9f0; }"
+    "window.lb-dark .modal, window.lb-dark .findbar { background: #2e3440; color: #eceff4; }"
+    "window.lb-light .modal, window.lb-light .findbar { background: #eceff4; color: #2e3440; }"
+    "window.lb-dark .modal entry, window.lb-dark .findbar entry { background: #3b4252; color: #eceff4; }"
+    "window.lb-light .modal entry, window.lb-light .findbar entry { background: #ffffff; color: #2e3440; }";
 
 /* Global widgets */
 static GtkWindow* window;
@@ -644,56 +653,31 @@ static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval
 }
 
 /* ---------------------------------------------------- system dark/light */
-/* Follow the desktop's GSettings live (matches the user's toggle script, which
- * sets org.gnome.desktop.interface gtk-theme + color-scheme). Setting
- * gtk-application-prefer-dark-theme makes WebKit report prefers-color-scheme to
- * web pages instantly; the GTK UI colours come from the user's themed gtk.css,
- * which we reload ourselves (see reload_user_theme_css). */
+/* Follow the desktop's GSettings `color-scheme` live. We deliberately do ONLY
+ * what the (working) AGS sideview does for the webview — set
+ * gtk-application-prefer-dark-theme — and nothing else that restyles the GTK
+ * tree, because reloading the system theme CSS makes WebKit stall on
+ * prefers-color-scheme (page needs a manual reload). The browser chrome instead
+ * carries its own Nord light/dark colours, switched by the lb-dark/lb-light
+ * class on the window (see CSS), so it follows instantly without touching the
+ * system theme. */
 static GSettings* iface_settings = NULL;
-
-/* GTK loads ~/.config/gtk-4.0/gtk.css at startup but monitors the *resolved*
- * file, so when the user's toggle script swaps that symlink to a different
- * theme GTK never reloads. We re-resolve and reload it ourselves so the UI
- * updates live. */
-static void reload_user_theme_css(void)
-{
-    static GtkCssProvider* provider = NULL;
-    char* link = g_build_filename(g_get_home_dir(), ".config", "gtk-4.0", "gtk.css", NULL);
-    char* target = g_file_read_link(link, NULL); /* the active theme's gtk.css, or NULL */
-    const char* path = target ? target : link;
-
-    if (g_file_test(path, G_FILE_TEST_EXISTS)) {
-        if (provider == NULL) {
-            provider = gtk_css_provider_new();
-            gtk_style_context_add_provider_for_display(gdk_display_get_default(),
-                GTK_STYLE_PROVIDER(provider), GTK_STYLE_PROVIDER_PRIORITY_USER);
-        }
-        gtk_css_provider_load_from_path(provider, path);
-    }
-    g_free(target);
-    g_free(link);
-}
 
 static void apply_system_theme(void)
 {
     if (iface_settings == NULL)
         return;
-    char* theme = g_settings_get_string(iface_settings, "gtk-theme");
     char* scheme = g_settings_get_string(iface_settings, "color-scheme");
     dark_mode = g_strcmp0(scheme, "prefer-dark") == 0;
-    GtkSettings* settings = gtk_settings_get_default();
+    g_free(scheme);
 
-    g_object_set(settings, "gtk-theme-name", theme, NULL);
-    reload_user_theme_css();
+    g_object_set(gtk_settings_get_default(), "gtk-application-prefer-dark-theme", dark_mode, NULL);
     update_all_backgrounds();
 
-    /* Apply the WebKit-driving property LAST, after the theme-CSS restyle, so the
-     * notify WebKit reacts to is the final change — otherwise the page only picks
-     * up the new color scheme after a manual reload. */
-    g_object_set(settings, "gtk-application-prefer-dark-theme", dark_mode, NULL);
-
-    g_free(theme);
-    g_free(scheme);
+    if (window != NULL) {
+        gtk_widget_add_css_class(GTK_WIDGET(window), dark_mode ? "lb-dark" : "lb-light");
+        gtk_widget_remove_css_class(GTK_WIDGET(window), dark_mode ? "lb-light" : "lb-dark");
+    }
 }
 
 static void on_interface_changed(GSettings* s, const char* key, gpointer data)
@@ -786,7 +770,6 @@ static void ensure_window(void)
     g_mkdir_with_parents(DATA_DIR, 0700);
     bookmarks_load(BOOKMARKS_DIR);
     g_object_set(gtk_settings_get_default(), GTK_SETTINGS_CONFIG_H, NULL);
-    setup_color_scheme();
 
     GtkCssProvider* css = gtk_css_provider_new();
     gtk_css_provider_load_from_string(css, CSS);
@@ -822,6 +805,10 @@ static void ensure_window(void)
     gtk_event_controller_set_propagation_phase(keys, GTK_PHASE_CAPTURE);
     g_signal_connect(keys, "key-pressed", G_CALLBACK(handle_signal_keypress), NULL);
     gtk_widget_add_controller(GTK_WIDGET(window), keys);
+
+    /* After the window exists so apply_system_theme can set the lb-dark/lb-light
+     * class on it; also sets dark_mode before the first tab's background. */
+    setup_color_scheme();
 
     notebook_create_new_tab(NULL); /* blank tab; spins up the web process */
 }
