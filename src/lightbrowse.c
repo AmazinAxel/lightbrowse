@@ -681,14 +681,19 @@ static void apply_system_theme(void)
     char* theme = g_settings_get_string(iface_settings, "gtk-theme");
     char* scheme = g_settings_get_string(iface_settings, "color-scheme");
     dark_mode = g_strcmp0(scheme, "prefer-dark") == 0;
-    g_object_set(gtk_settings_get_default(),
-        "gtk-theme-name", theme,
-        "gtk-application-prefer-dark-theme", dark_mode,
-        NULL);
-    g_free(theme);
-    g_free(scheme);
+    GtkSettings* settings = gtk_settings_get_default();
+
+    g_object_set(settings, "gtk-theme-name", theme, NULL);
     reload_user_theme_css();
     update_all_backgrounds();
+
+    /* Apply the WebKit-driving property LAST, after the theme-CSS restyle, so the
+     * notify WebKit reacts to is the final change — otherwise the page only picks
+     * up the new color scheme after a manual reload. */
+    g_object_set(settings, "gtk-application-prefer-dark-theme", dark_mode, NULL);
+
+    g_free(theme);
+    g_free(scheme);
 }
 
 static void on_interface_changed(GSettings* s, const char* key, gpointer data)
