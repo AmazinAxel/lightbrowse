@@ -8,7 +8,7 @@ CC ?= gcc
 WARNINGS=-Wall -Wextra -Wshadow -Wformat=2 -Wno-unused-parameter
 OPTIMIZED=-O2
 DEBUG=-g
-STD=-std=c99
+STD=-std=c23
 SECURITY=-fstack-protector-strong
 
 # Dependencies for WebKitGTK 6 / GTK4
@@ -27,7 +27,7 @@ include src/plugins/plugins.mk
 SHARE_DIR=$(CURDIR)/out/share/lightbrowse
 ADBLOCK_DIR=src/plugins/adblock
 
-.PHONY: build assets adblock constants format clean run inspect
+.PHONY: build assets adblock format lint clean run inspect
 
 build: assets $(SRC) $(PLUGINS) $(CONFIG)
 	$(CC) $(STD) $(WARNINGS) $(SECURITY) $(OPTIMIZED) $(DEBUG) \
@@ -45,12 +45,13 @@ adblock:
 	  ADBLOCK_FILTERLIST_PATH=$(SHARE_DIR)/filterlist.txt
 	cp -f $(ADBLOCK_DIR)/liblightbrowse-adblock.so $(SHARE_DIR)/extensions/
 
-constants:
-	cd src/plugins/readability/ && sh recompute_READABILITY_N.sh
-
 format:
 	clang-format -i -style="{BasedOnStyle: webkit, AllowShortIfStatementsOnASingleLine: true, IndentCaseLabels: true, AllowShortEnumsOnASingleLine: true}" \
 	  $(SRC) $(PLUGINS) $(CONFIG)
+
+lint:
+	clang-tidy $(SRC) $(PLUGINS) -- $(STD) $(WARNINGS) $(OPTIMIZED) \
+	  -DLIGHTBROWSE_SHARE_DIR='"$(SHARE_DIR)"' $(INCS)
 
 clean:
 	rm -rf out

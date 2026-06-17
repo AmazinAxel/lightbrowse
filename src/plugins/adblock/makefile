@@ -4,7 +4,7 @@
 # that WebKit loads into the web process.
 
 CC ?= gcc
-CFLAGS ?= -Wall -Wextra -O2 -fPIC
+CFLAGS ?= -std=c23 -Wall -Wextra -O2 -fPIC
 LDFLAGS ?= -shared
 
 # WebKit dependencies

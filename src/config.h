@@ -25,7 +25,6 @@
 
 /* Plugins */
 #define READABILITY_ENABLED true
-#define CUSTOM_USER_AGENT false
 #define ADBLOCK_ENABLED true
 #define ADBLOCK_EXTENSIONS_DIR LIGHTBROWSE_SHARE_DIR "/extensions"
 #define ADBLOCK_FILTERLIST_PATH LIGHTBROWSE_SHARE_DIR "/filterlist.txt"
