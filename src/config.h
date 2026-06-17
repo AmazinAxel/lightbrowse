@@ -74,9 +74,10 @@ typedef enum {
     find_reset,
 
     bookmark_add,
+    edit_uri,
     toggle_tabs,
 
-    prettify
+    reading_mode
 } func;
 
 static struct {
@@ -92,7 +93,8 @@ static struct {
     { CTRL,        KEY(r),             refresh              },
     { CTRL,        KEY(R),             refresh_force        },
 
-    { CTRL,        KEY(p),             prettify             },
+    { CTRL,        KEY(p),             reading_mode         },
+    { CTRL,        KEY(z),             edit_uri             },
 
     { CTRL,        KEY(equal),         zoomin               },
     { CTRL,        KEY(minus),         zoomout              },

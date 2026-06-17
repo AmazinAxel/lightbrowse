@@ -20,7 +20,7 @@ static const char* CSS =
     ".tab.active { border-color: #5e81ac; }"
     ".dim { background: alpha(black, 0.3); }"
     ".modal { background: @theme_bg_color; color: @theme_fg_color; border: 2px solid #5e81ac; border-radius: 12px; padding: 6px; }"
-    ".modal entry { min-width: 440px; }"
+    ".modal entry { min-width: 280px; }"
     ".modal label { margin: 3px 0; padding: 6px; }"
     ".modal .selected { background: #81A1C1; color: #ECEFF4; outline: 2px #5E81AC; border-radius: 4px; }"
     ".findbar { background: @theme_bg_color; color: @theme_fg_color; border: 1px solid #5e81ac; border-radius: 8px; padding: 4px; margin-bottom: 12px; }";
@@ -155,11 +155,14 @@ static void update_all_backgrounds(void)
 }
 
 /* ----------------------------------------------------------------- tabs */
-static void on_tab_clicked(GtkButton* button, WebKitWebView* view)
+/* Switch on press (capture phase) rather than on the button's release-driven
+ * "clicked", so mouse selection feels as instant as the keyboard. */
+static void on_tab_pressed(GtkGestureClick* gesture, int n_press, double x, double y, WebKitWebView* view)
 {
     int n = gtk_notebook_page_num(notebook, GTK_WIDGET(view));
     if (n >= 0)
         gtk_notebook_set_current_page(notebook, n);
+    gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
 }
 
 static void update_favicon(WebKitWebView* view)
@@ -169,7 +172,7 @@ static void update_favicon(WebKitWebView* view)
     if (fav != NULL)
         gtk_image_set_from_paintable(img, GDK_PAINTABLE(fav));
     else
-        gtk_image_set_from_icon_name(img, "folder-globe-symbolic");
+        gtk_image_set_from_icon_name(img, "folder-earth-symbolic");
 }
 
 static void on_favicon_notify(GObject* view, GParamSpec* pspec, gpointer data)
@@ -201,14 +204,17 @@ static WebKitWebView* append_tab(void)
 
     GtkWidget* img = gtk_image_new();
     gtk_image_set_pixel_size(GTK_IMAGE(img), TAB_ICON_SIZE);
-    gtk_image_set_from_icon_name(GTK_IMAGE(img), "folder-globe-symbolic");
+    gtk_image_set_from_icon_name(GTK_IMAGE(img), "folder-earth-symbolic");
     GtkWidget* btn = gtk_button_new();
     gtk_button_set_child(GTK_BUTTON(btn), img);
     gtk_widget_add_css_class(btn, "tab");
     gtk_widget_set_focusable(btn, FALSE); /* no focus ring on tab buttons */
     g_object_set_data(G_OBJECT(view), "icon", img);
     g_object_set_data(G_OBJECT(view), "button", btn);
-    g_signal_connect(btn, "clicked", G_CALLBACK(on_tab_clicked), view);
+    GtkGesture* click = gtk_gesture_click_new();
+    gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(click), GTK_PHASE_CAPTURE);
+    g_signal_connect(click, "pressed", G_CALLBACK(on_tab_pressed), view);
+    gtk_widget_add_controller(btn, GTK_EVENT_CONTROLLER(click));
     gtk_box_append(tabbar, btn);
 
     g_signal_connect(view, "create", G_CALLBACK(on_create_tab), NULL);
@@ -558,11 +564,23 @@ static void handle_shortcut(func id)
         case bookmark_add:
             modal_show(MODAL_BOOKMARK, FALSE);
             break;
+        case edit_uri: {
+            /* Open the search modal pre-filled with the current URL; Enter
+             * replaces the current tab (modal_new_tab = FALSE). */
+            modal_show(MODAL_SEARCH, FALSE);
+            const char* uri = view ? webkit_web_view_get_uri(view) : NULL;
+            if (uri != NULL) {
+                gtk_editable_set_text(GTK_EDITABLE(modal_entry1), uri);
+                gtk_editable_select_region(GTK_EDITABLE(modal_entry1), 0, -1);
+            }
+            break;
+        }
         case toggle_tabs:
             tabbar_visible = !tabbar_visible;
             gtk_widget_set_visible(GTK_WIDGET(tabbar), tabbar_visible);
             break;
-        case prettify:
+        case reading_mode:
+            /* Apply the reader transform (refresh the page to undo it). */
             if (READABILITY_ENABLED && view) {
                 char* js = read_readability_js();
                 if (js != NULL) {
@@ -639,7 +657,12 @@ static void apply_system_theme(void)
     char* theme = g_settings_get_string(iface_settings, "gtk-theme");
     char* scheme = g_settings_get_string(iface_settings, "color-scheme");
     dark_mode = g_strcmp0(scheme, "prefer-dark") == 0;
-    g_object_set(gtk_settings_get_default(),
+    GtkSettings* s = gtk_settings_get_default();
+    /* GTK may have already synced gtk-theme-name from gsettings without
+     * restyling existing widgets, so a plain set would be a no-op. Bounce it
+     * through a throwaway value to force a real theme reload from disk. */
+    g_object_set(s, "gtk-theme-name", "", NULL);
+    g_object_set(s,
         "gtk-theme-name", theme,
         "gtk-application-prefer-dark-theme", dark_mode,
         NULL);
@@ -707,7 +730,7 @@ static void build_modal(void)
 
 static void build_findbar(void)
 {
-    findbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    findbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     gtk_widget_add_css_class(findbar, "findbar");
     gtk_widget_set_halign(findbar, GTK_ALIGN_CENTER);
     gtk_widget_set_valign(findbar, GTK_ALIGN_END);
