@@ -17,7 +17,7 @@
  *  along with Epiphany.  If not, see <http://www.gnu.org/licenses/>.
  *
  *  Some parts based on Midori's 'adblock' extension.
- *  Adapted for rosenrot browser.
+ *  Adapted for lightbrowse browser.
  */
 
 #include "uri_tester.h"

@@ -1,4 +1,5 @@
 #include <gdk/gdk.h>
+#include <glib/gstdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <webkit/webkit.h>
@@ -17,7 +18,6 @@ static struct {
     Bar_entry_mode entry_mode;
 } bar;
 static int num_tabs = 0;
-static int custom_style_enabled = 1;
 
 /* Forward declarations */
 void toggle_bar(GtkNotebook* notebook, Bar_entry_mode mode);
@@ -26,7 +26,7 @@ static int handle_signal_keypress(void* self, int keyval, int keycode,
     GdkModifierType state, void* controller);
 
 /* Utils */
-WebKitWebView* notebook_get_webview(GtkNotebook* notebook) /* TODO: Think through whether to pass global variables or not */ 
+WebKitWebView* notebook_get_webview(GtkNotebook* notebook) /* TODO: Think through whether to pass global variables or not */
 {
     WebKitWebView* view = WEBKIT_WEB_VIEW(gtk_notebook_get_nth_page(notebook, gtk_notebook_get_current_page(notebook)));
     NULLCHECK(view);
@@ -41,13 +41,13 @@ void load_uri(WebKitWebView* view, const char* uri)
         webkit_web_view_load_uri(view, "");
         toggle_bar(global_notebook, _SEARCH);
         return;
-    } 
+    }
 
-    bool has_direct_uri_prefix = g_str_has_prefix(uri, "http://") || g_str_has_prefix(uri, "https://") || g_str_has_prefix(uri, "file://") || g_str_has_prefix(uri, "about:");
+    bool has_direct_uri_prefix = g_str_has_prefix(uri, "http://") || g_str_has_prefix(uri, "https://") || g_str_has_prefix(uri, "file://") || g_str_has_prefix(uri, "about:") || g_str_has_prefix(uri, "data:");
     if (has_direct_uri_prefix){
         webkit_web_view_load_uri(view, uri);
         return;
-    } 
+    }
 
     bool has_common_domain_extension = (strstr(uri, ".com") || strstr(uri, ".org"));
     if (has_common_domain_extension){
@@ -55,7 +55,7 @@ void load_uri(WebKitWebView* view, const char* uri)
         snprintf(tmp, sizeof(tmp), "https://%s", uri);
         webkit_web_view_load_uri(view, tmp);
         return;
-    } 
+    }
 
     int l = SHORTCUT_N + strlen(uri) + 1;
     char uri_expanded[l];
@@ -65,39 +65,11 @@ void load_uri(WebKitWebView* view, const char* uri)
     if (has_shortcut){
         webkit_web_view_load_uri(view, uri_expanded);
         return;
-    } 
+    }
 
     char tmp[strlen(uri) + strlen(SEARCH)];
     snprintf(tmp, sizeof(tmp), SEARCH, uri);
     webkit_web_view_load_uri(view, tmp);
-}
-
-/* Deal with new load or changed load */
-void redirect_if_annoying(WebKitWebView* view, const char* uri)
-{
-    if (LIBRE_REDIRECT_ENABLED) {
-        int l = LIBRE_N + strlen(uri) + 1;
-        char uri_filtered[l];
-        str_init(uri_filtered, l);
-
-        int check = libre_redirect(uri, uri_filtered);
-        if (check == 2) webkit_web_view_load_uri(view, uri_filtered);
-    }
-}
-void set_custom_style(WebKitWebView* view)
-{
-    if (custom_style_enabled) {
-        char* style_js = malloc(STYLE_N + 1);
-        if (style_js == NULL) {
-            fprintf(stderr, "Failed to allocate memory for style_js\n");
-            return;
-        }
-        read_style_js(style_js);
-        if (style_js != NULL) {
-            webkit_web_view_evaluate_javascript(view, style_js, -1, NULL, "rosenrot-style-plugin", NULL, NULL, NULL);
-        }
-        free(style_js);
-    }
 }
 
 void handle_signal_load_changed(WebKitWebView* self, WebKitLoadEvent load_event,
@@ -107,12 +79,9 @@ void handle_signal_load_changed(WebKitWebView* self, WebKitLoadEvent load_event,
         // https://webkitgtk.org/reference/webkit2gtk/2.5.1/WebKitWebView.html
         case WEBKIT_LOAD_STARTED:
         case WEBKIT_LOAD_COMMITTED:
-            set_custom_style(self); /*fallthrough */
         case WEBKIT_LOAD_REDIRECTED:
-            redirect_if_annoying(self, webkit_web_view_get_uri(self));
             break;
         case WEBKIT_LOAD_FINISHED: {
-            set_custom_style(self);
             /* Add gtk tab title */
             const char* webpage_title = webkit_web_view_get_title(self);
             const int max_length = 25;
@@ -140,11 +109,11 @@ static WebKitWebContext* get_shared_web_context()
 {
     if (shared_web_context == NULL) {
         shared_web_context = webkit_web_context_new();
-        
+
         /* Configure web extensions for adblock if enabled */
         if (ADBLOCK_ENABLED) {
             webkit_web_context_set_web_process_extensions_directory(shared_web_context, ADBLOCK_EXTENSIONS_DIR);
-            
+
             /* Pass configuration to the extension */
             GVariantBuilder builder;
             g_variant_builder_init(&builder, G_VARIANT_TYPE_VARDICT);
@@ -162,9 +131,7 @@ WebKitWebView* create_new_webview()
     if (CUSTOM_USER_AGENT) {
         webkit_settings_set_user_agent(
             settings,
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, "
-            "like Gecko) Chrome/120.0.0.0 Safari/537.3");
-            // https://www.useragents.me
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15");
     }
     WebKitNetworkSession* network_session = webkit_network_session_new(DATA_DIR, DATA_DIR);
     WebKitUserContentManager* contentmanager = webkit_user_content_manager_new();
@@ -199,7 +166,7 @@ GtkWidget* handle_signal_create_new_tab(WebKitWebView* self,
         notebook_create_new_tab(notebook, uri);
         gtk_notebook_set_show_tabs(notebook, true);
     } else {
-        webkit_web_view_evaluate_javascript(self, "alert('Too many tabs, not opening a new one')", -1, NULL, "rosenrot-alert-numtabs", NULL, NULL, NULL);
+        webkit_web_view_evaluate_javascript(self, "alert('Too many tabs, not opening a new one')", -1, NULL, "lightbrowse-alert-numtabs", NULL, NULL, NULL);
     }
     return ABORT_REQUEST_ON_CURRENT_TAB;
     // Could also return GTK_WIDGET(self), in which case the new uri would also be loaded in the current webview. This could be interesting if I wanted to e.g., open an alternative frontend in a new tab
@@ -222,15 +189,13 @@ void notebook_create_new_tab(GtkNotebook* notebook, const char* uri)
         gtk_widget_set_visible(GTK_WIDGET(bar.widget), 0);
         load_uri(view, (uri) ? uri : HOME);
 
-        set_custom_style(view);
-
         gtk_notebook_set_current_page(notebook, n);
         gtk_notebook_set_tab_label_text(notebook, GTK_WIDGET(view), "-");
         webkit_web_view_set_zoom_level(view, ZOOM_START_LEVEL);
         num_tabs += 1;
     } else {
         webkit_web_view_evaluate_javascript(notebook_get_webview(notebook), "alert('Too many tabs, not opening a new one')",
-            -1, NULL, "rosenrot-alert-numtabs", NULL, NULL, NULL);
+            -1, NULL, "lightbrowse-alert-numtabs", NULL, NULL, NULL);
     }
 }
 
@@ -295,7 +260,7 @@ void handle_signal_bar_press_enter(GtkEntry* self, GtkNotebook* notebook) /* con
             const char* js_template = "filterByKeyword(\"%s\")";
             char js_command[strlen(js_template) + strlen(bar_line_text) + 2];
             snprintf(js_command, sizeof(js_command), js_template, bar_line_text);
-            webkit_web_view_evaluate_javascript(view, js_command, -1, NULL, "rosenrot-filter-plugin", NULL, NULL, NULL);
+            webkit_web_view_evaluate_javascript(view, js_command, -1, NULL, "lightbrowse-filter-plugin", NULL, NULL, NULL);
             gtk_widget_set_visible(GTK_WIDGET(bar.widget), 0);
 
             break;
@@ -324,18 +289,11 @@ int handle_shortcut(func id)
             webkit_web_view_go_forward(view);
             break;
 
-        case toggle_custom_style: 
-            custom_style_enabled ^= 1; 
-            // fallthrough
         case refresh:
             webkit_web_view_reload(view);
             break;
         case refresh_force:
             webkit_web_view_reload_bypass_cache(view);
-            break;
-
-        case back_to_home:
-            load_uri(view, HOME);
             break;
 
         case zoomin:
@@ -412,13 +370,6 @@ int handle_shortcut(func id)
             toggle_bar(global_notebook, _HIDDEN);
             break;
 
-        case halve_window:
-            gtk_window_set_default_size(window, FULL_WIDTH/2, HEIGHT);
-            break;
-        case rebig_window:
-            gtk_window_set_default_size(window, FULL_WIDTH, HEIGHT);
-            break;
-
         case prettify: {
             if (READABILITY_ENABLED) {
                 char* readability_js = malloc(READABILITY_N + 1);
@@ -428,31 +379,10 @@ int handle_shortcut(func id)
                 }
                 read_readability_js(readability_js);
                 if (readability_js != NULL) {
-                    webkit_web_view_evaluate_javascript(view, readability_js, -1, NULL, "rosenrot-readability-plugin", NULL, NULL, NULL);
+                    webkit_web_view_evaluate_javascript(view, readability_js, -1, NULL, "lightbrowse-readability-plugin", NULL, NULL, NULL);
                 }
                 free(readability_js);
             }
-            break;
-        }
-
-        case save_uri_to_txt: {
-            const char* uri = webkit_web_view_get_uri(view);
-            FILE *f = fopen("/opt/rosenrot/uris.txt", "a");
-            if (f == NULL) {
-                printf("Error opening /opt/rosenrot/uris.txt");
-            } else {
-                fprintf(f, "%s\n", uri);
-                fclose(f);
-                webkit_web_view_evaluate_javascript(view, "alert('Saved current uri to /opt/rosenrot/uris.txt')", -1, NULL, "rosenrot-alert-numtabs", NULL, NULL, NULL);
-            }
-            break;
-        }
-        case open_uri_in_brave: {
-            const char* uri = webkit_web_view_get_uri(view);
-            const char* brave_command = "brave-browser --app=%s --new-window --start-fullscreen &";
-            char cmd[strlen(brave_command) + strlen(uri) + 2];
-            snprintf(cmd, sizeof(cmd), brave_command, uri);
-            if(system(cmd) == -1) printf("Error opening in brave browser");
             break;
         }
     }
@@ -483,13 +413,13 @@ static int handle_signal_keypress(void* self, int keyval, int keycode,
 
 int main(int argc, char** argv)
 {
+    // Ensure the cache/data directory exists before WebKit needs it
+    g_mkdir_with_parents(DATA_DIR, 0700);
+
     // Initialize GTK in general
     gtk_init();
-    g_object_set(gtk_settings_get_default(), GTK_SETTINGS_CONFIG_H, NULL); 
+    g_object_set(gtk_settings_get_default(), GTK_SETTINGS_CONFIG_H, NULL);
     // https://docs.gtk.org/gobject/method.Object.set.html
-    GtkCssProvider* css = gtk_css_provider_new();
-    gtk_css_provider_load_from_path(css, "/opt/rosenrot/style-gtk4.css");
-    gtk_style_context_add_provider_for_display(gdk_display_get_default(), GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_USER);
 
     // Create the main window
     window = GTK_WINDOW(gtk_window_new());
@@ -516,20 +446,20 @@ int main(int argc, char** argv)
     g_signal_connect(event_controller, "key-pressed", G_CALLBACK(handle_signal_keypress), NULL);
     gtk_widget_add_controller(GTK_WIDGET(window), event_controller);
 
-    g_signal_connect(bar.line, "activate", G_CALLBACK(handle_signal_bar_press_enter), global_notebook); 
+    g_signal_connect(bar.line, "activate", G_CALLBACK(handle_signal_bar_press_enter), global_notebook);
     g_signal_connect(GTK_WIDGET(window), "destroy", G_CALLBACK(exit), global_notebook);
 
     // Load first tab
     char* first_uri = argc > 1 ? argv[1] : HOME;
     notebook_create_new_tab(global_notebook, first_uri);
 
-    // Show to user 
+    // Show to user
     // The first two commands might be redundant with notebook_create_new_tab
-    gtk_window_present(window); 
+    gtk_window_present(window);
     gtk_widget_set_visible(GTK_WIDGET(window), 1);
     if (argc != 0) gtk_widget_set_visible(GTK_WIDGET(bar.widget), 0);
 
-    // Deal with more tabs, if any 
+    // Deal with more tabs, if any
     if (argc > 2) {
         gtk_notebook_set_show_tabs(global_notebook, true);
         for (int i = 2; i < argc; i++) {

@@ -1,19 +1,19 @@
 /*
- * Rosenrot Adblock Web Extension
- * 
- * This is a WebKit web extension that runs in the web process and
- * intercepts HTTP requests to block ads using easylist.txt filters.
+ * Lightbrowse Adblock Web Extension
  *
- * Copyright 2024 Rosenrot contributors
+ * This is a WebKit web extension that runs in the web process and
+ * intercepts HTTP requests to block ads using the combined filter list.
+ *
  * License: GPL-3.0
  */
 
 #include <webkit/webkit-web-process-extension.h>
 #include "uri_tester.h"
 
-/* Configuration - must match ADBLOCK_FILTERLIST_PATH in config.h */
+/* Configuration - must match ADBLOCK_FILTERLIST_PATH in config.h.
+ * Overridden at build time via -DADBLOCK_FILTERLIST_PATH=... */
 #ifndef ADBLOCK_FILTERLIST_PATH
-#define ADBLOCK_FILTERLIST_PATH "/opt/rosenrot/easylist.txt"
+#define ADBLOCK_FILTERLIST_PATH "/opt/lightbrowse/filterlist.txt"
 #endif
 
 static AdblockUriTester* tester = NULL;
@@ -46,7 +46,7 @@ on_send_request(WebKitWebPage* page,
 
     /* Check if this URI should be blocked */
     if (adblock_uri_tester_test_uri(tester, request_uri, page_uri)) {
-        g_debug("[rosenrot-adblock] Blocked: %s", request_uri);
+        g_debug("[lightbrowse-adblock] Blocked: %s", request_uri);
         return TRUE; /* Block the request */
     }
 
@@ -87,14 +87,14 @@ webkit_web_process_extension_initialize_with_user_data(WebKitWebProcessExtension
     }
 
     if (!adblock_enabled) {
-        g_debug("[rosenrot-adblock] Adblock disabled by configuration");
+        g_debug("[lightbrowse-adblock] Adblock disabled by configuration");
         return;
     }
 
     /* Check if filter file exists */
     if (!g_file_test(ADBLOCK_FILTERLIST_PATH, G_FILE_TEST_EXISTS)) {
-        g_warning("[rosenrot-adblock] Filter file not found: %s", ADBLOCK_FILTERLIST_PATH);
-        g_warning("[rosenrot-adblock] Download easylist.txt from https://easylist.to/easylist/easylist.txt");
+        g_warning("[lightbrowse-adblock] Filter file not found: %s", ADBLOCK_FILTERLIST_PATH);
+        g_warning("[lightbrowse-adblock] Adblock disabled (the Nix package builds this list automatically)");
         return;
     }
 
@@ -102,7 +102,7 @@ webkit_web_process_extension_initialize_with_user_data(WebKitWebProcessExtension
     tester = adblock_uri_tester_new(ADBLOCK_FILTERLIST_PATH);
     adblock_uri_tester_load(tester);
 
-    g_debug("[rosenrot-adblock] Loaded filters from %s", ADBLOCK_FILTERLIST_PATH);
+    g_debug("[lightbrowse-adblock] Loaded filters from %s", ADBLOCK_FILTERLIST_PATH);
 
     /* Connect to page-created to hook into each new page */
     g_signal_connect(extension, "page-created", G_CALLBACK(on_page_created), NULL);
