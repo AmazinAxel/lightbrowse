@@ -1,19 +1,16 @@
 #include <stdbool.h>
 #include <gtk/gtk.h>
 
-#define HEIGHT      700
-#define FULL_WIDTH  800
-#define WIDTH       FULL_WIDTH
-#define BAR_WIDTH   250
-
 #define ZOOM_START_LEVEL 1.0
 #define ZOOM_STEPSIZE .1
-#define MAX_NUM_TABS 8 // false for inf tabs
+#define MAX_NUM_TABS 8 // 0 for inf tabs
+#define CLOSED_TAB_HISTORY 3 // how many closed tabs can be reopened (ctrl+shift+t)
+#define FUZZY_RESULTS 3 // max bookmark suggestions shown in the search modal
+#define TAB_ICON_SIZE 24 // px, favicon size in the vertical tab strip
 #define SEARCH "https://bing.com/search?q=%s"
 
-/* Self-contained homepage (a data: URI, so no homepage file is shipped).
- * "data:" is whitelisted as a direct URI prefix in load_uri(). */
-#define HOME "data:text/html,<!DOCTYPE html><html style=%22background:%232e3440%22><title>Homepage</title></html>"
+#define DATA_DIR "/home/alec/.config/lightbrowse"
+#define BOOKMARKS_DIR DATA_DIR "/bookmarks"
 
 /* Runtime asset directory.
  * The Nix package overrides this at build time (-DLIGHTBROWSE_SHARE_DIR=...)
@@ -38,16 +35,11 @@
     "enable-smooth-scrolling", true, \
     "default-charset", "utf-8"
 
-#define DATA_DIR "/home/alec/.cache/lightbrowse"
-#define DATA_MANAGER_OPTS "base-cache-directory", DATA_DIR, "base-data-directory", DATA_DIR
-#define NETWORK_SESSION_OPTS DATA_DIR, DATA_DIR
-
 #define GTK_SETTINGS_CONFIG_H "gtk-enable-animations", false
 #define KEY(x) GDK_KEY_##x
 #define SFT  1 << 0
 #define CTRL 1 << 2
 #define ALT  1 << 3
-#define BACKTICK 96
 
 /* Misc helpers */
 #define ABORT_REQUEST_ON_CURRENT_TAB NULL
@@ -68,8 +60,6 @@ typedef enum {
     refresh,
     refresh_force,
 
-    toggle_fullscreen,
-
     zoomin,
     zoomout,
     zoom_reset,
@@ -78,13 +68,13 @@ typedef enum {
     next_tab,
     prev_tab,
     close_tab,
+    reopen_tab,
 
-    show_searchbar,
-    hide_bar,
     show_finder,
-    finder_next,
-    finder_prev,
-    filter,
+    find_reset,
+
+    bookmark_add,
+    toggle_tabs,
 
     prettify
 } func;
@@ -95,12 +85,12 @@ static struct {
     func id;
 } shortcut[] = {
     { CTRL,        KEY(h),             goback               },
+    { CTRL,        KEY(Left),          goback               },
     { CTRL,        KEY(j),             goforward            },
+    { CTRL,        KEY(Right),         goforward            },
 
     { CTRL,        KEY(r),             refresh              },
     { CTRL,        KEY(R),             refresh_force        },
-
-    { 0x0,         KEY(F11),           toggle_fullscreen    },
 
     { CTRL,        KEY(p),             prettify             },
 
@@ -112,11 +102,11 @@ static struct {
     { ALT,         KEY(Tab),           prev_tab             },
     { CTRL,        KEY(t),             new_tab              },
     { CTRL,        KEY(w),             close_tab            },
+    { CTRL,        KEY(T),             reopen_tab           },
 
-    { CTRL,        KEY(l),             show_searchbar       },
-    { CTRL,        KEY(o),             hide_bar             },
     { CTRL,        KEY(f),             show_finder          },
-    { CTRL,        KEY(n),             finder_next          },
-    { CTRL,        KEY(N),             finder_prev          },
-    { CTRL,        KEY(F),             filter               },
+    { CTRL,        KEY(F),             find_reset           },
+
+    { CTRL,        KEY(b),             bookmark_add         },
+    { CTRL,        KEY(s),             toggle_tabs          },
 };

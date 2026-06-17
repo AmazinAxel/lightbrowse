@@ -42,6 +42,7 @@
           buildInputs = (with pkgs; [
             glib
             glib-networking
+            gsettings-desktop-schemas # color scheme
             gtk4
             webkitgtk_6_0
           ]) ++ gstPlugins;
@@ -68,6 +69,7 @@
                 $(pkg-config --cflags webkitgtk-6.0 gtk4) \
                 src/plugins/shortcuts/shortcuts.c \
                 src/plugins/readability/readability.c \
+                src/plugins/bookmarks/bookmarks.c \
                 src/lightbrowse.c \
                 -o out/lightbrowse \
                 $(pkg-config --libs webkitgtk-6.0 gtk4)
@@ -96,6 +98,19 @@
               install -Dm755 out/liblightbrowse-adblock.so \
                 $out/share/lightbrowse/extensions/liblightbrowse-adblock.so
               install -Dm644 ${filterList} $out/share/lightbrowse/filterlist.txt
+
+              # Desktop entry: required so the system can route http(s) links to
+              install -d $out/share/applications
+              printf '%s\n' \
+                '[Desktop Entry]' \
+                'Type=Application' \
+                'Name=Lightbrowse' \
+                "Exec=$out/bin/lightbrowse %U" \
+                'Terminal=false' \
+                'NoDisplay=true' \
+                'StartupNotify=false' \
+                'MimeType=x-scheme-handler/http;x-scheme-handler/https;text/html;' \
+                > $out/share/applications/com.amazinaxel.lightbrowse.desktop
               runHook postInstall
             '';
           };
@@ -127,6 +142,7 @@
             buildInputs = (with pkgs; [
               glib
               glib-networking
+              gsettings-desktop-schemas
               gtk4
               webkitgtk_6_0
             ]) ++ gstPlugins;
