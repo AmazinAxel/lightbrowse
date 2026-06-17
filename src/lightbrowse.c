@@ -645,10 +645,34 @@ static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval
 
 /* ---------------------------------------------------- system dark/light */
 /* Follow the desktop's GSettings live (matches the user's toggle script, which
- * sets org.gnome.desktop.interface gtk-theme + color-scheme). Pushing
- * gtk-theme-name updates the GTK UI and gtk-application-prefer-dark-theme makes
- * WebKit report prefers-color-scheme:dark to web pages — both without a restart. */
+ * sets org.gnome.desktop.interface gtk-theme + color-scheme). Setting
+ * gtk-application-prefer-dark-theme makes WebKit report prefers-color-scheme to
+ * web pages instantly; the GTK UI colours come from the user's themed gtk.css,
+ * which we reload ourselves (see reload_user_theme_css). */
 static GSettings* iface_settings = NULL;
+
+/* GTK loads ~/.config/gtk-4.0/gtk.css at startup but monitors the *resolved*
+ * file, so when the user's toggle script swaps that symlink to a different
+ * theme GTK never reloads. We re-resolve and reload it ourselves so the UI
+ * updates live. */
+static void reload_user_theme_css(void)
+{
+    static GtkCssProvider* provider = NULL;
+    char* link = g_build_filename(g_get_home_dir(), ".config", "gtk-4.0", "gtk.css", NULL);
+    char* target = g_file_read_link(link, NULL); /* the active theme's gtk.css, or NULL */
+    const char* path = target ? target : link;
+
+    if (g_file_test(path, G_FILE_TEST_EXISTS)) {
+        if (provider == NULL) {
+            provider = gtk_css_provider_new();
+            gtk_style_context_add_provider_for_display(gdk_display_get_default(),
+                GTK_STYLE_PROVIDER(provider), GTK_STYLE_PROVIDER_PRIORITY_USER);
+        }
+        gtk_css_provider_load_from_path(provider, path);
+    }
+    g_free(target);
+    g_free(link);
+}
 
 static void apply_system_theme(void)
 {
@@ -657,17 +681,13 @@ static void apply_system_theme(void)
     char* theme = g_settings_get_string(iface_settings, "gtk-theme");
     char* scheme = g_settings_get_string(iface_settings, "color-scheme");
     dark_mode = g_strcmp0(scheme, "prefer-dark") == 0;
-    GtkSettings* s = gtk_settings_get_default();
-    /* GTK may have already synced gtk-theme-name from gsettings without
-     * restyling existing widgets, so a plain set would be a no-op. Bounce it
-     * through a throwaway value to force a real theme reload from disk. */
-    g_object_set(s, "gtk-theme-name", "", NULL);
-    g_object_set(s,
+    g_object_set(gtk_settings_get_default(),
         "gtk-theme-name", theme,
         "gtk-application-prefer-dark-theme", dark_mode,
         NULL);
     g_free(theme);
     g_free(scheme);
+    reload_user_theme_css();
     update_all_backgrounds();
 }
 
