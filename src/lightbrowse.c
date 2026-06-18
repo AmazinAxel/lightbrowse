@@ -11,15 +11,19 @@
 
 static const char* CSS =
     ".tabbar { background: shade(@theme_bg_color, 1.2); border-right: 0.25rem solid #5e81ac; padding: 4px; }"
-    ".tab { padding: 6px; margin: 2px 0; min-height: 0; min-width: 0; border: 2px solid transparent; border-radius: 4px; outline: none; box-shadow: none; }"
-    ".tab:hover, .tab:focus, .tab:active, .tab:checked { outline: none; box-shadow: none; }"
+    ".tab { padding: 4px; border: 2px solid #4C566A; border-radius: 4px; outline: none; box-shadow: none; transition: border-color .1s ease; }"
     ".tab.active { border-color: #5e81ac; }"
     ".dim { background: alpha(black, 0.3); }"
-    ".modal { background: @theme_bg_color; color: @theme_fg_color; border: 2px solid #5e81ac; border-radius: 12px; padding: 6px; }"
+    ".modal { background: @theme_bg_color; color: @theme_fg_color; border: 2px solid #5e81ac; border-radius: 12px; padding: 12px; }"
     ".modal entry { min-width: 280px; }"
-    ".modal label { margin: 3px 0; padding: 6px; }"
-    ".modal .selected { background: #81A1C1; color: #ECEFF4; outline: 2px #5E81AC; border-radius: 4px; }"
-    ".findbar { background: @theme_bg_color; color: @theme_fg_color; border: 1px solid #5e81ac; border-radius: 8px; padding: 4px; margin-bottom: 12px; }";
+    ".modal label { padding: 8px; border: 1px solid #4C566A; background-color: #3B4252; border-radius: 6px; transition: all 120ms ease; }"
+    ".modal .selected { background: #81A1C1; color: #ECEFF4; border-color: #D8DEE9; transform: translateY(-2px) scale(1.01); outline: 2px solid #81A1C1; outline-offset: 1px; }"
+
+    ".findbar { background: @theme_bg_color; color: @theme_fg_color; border: 1px solid #5e81ac; border-radius: 8px; padding: 4px; margin-bottom: 12px; outline: 2px solid #5E81AC; }"
+
+    ".statusbar label { color: @theme_fg_color; font-size: 0.85em; padding: 2px 4px; background: shade(@theme_bg_color, 1.2); border-top-right-radius: 6px; }"
+    "progressbar.loadbar trough { border: none; background: transparent; border-radius: 0; padding: 0; min-height: 3px; }"
+    "progressbar.loadbar progress { border: none; border-radius: 0; background: #5e81ac; }";
 
 /* Global widgets */
 static GtkWindow* window;
@@ -51,6 +55,13 @@ static GtkLabel* find_label;
 static guint find_total = 0;
 static guint find_current = 0;
 
+/* Bottom status / loading bar (the whole bar hides when idle) */
+static GtkWidget* statusbar;       /* container: hidden unless loading or hovering */
+static GtkLabel* status_label;     /* hovered or keyboard-focused link */
+static GtkProgressBar* progress;   /* page load progress (hidden when idle) */
+static char* status_link = NULL;   /* hovered or keyboard-focused link URI */
+static gboolean page_loading = FALSE;
+
 /* Closed-tab ring (full WebKit session state, so the webview is freed) */
 static WebKitWebViewSessionState* closed_tabs[CLOSED_TAB_HISTORY];
 static int closed_count = 0;
@@ -59,6 +70,7 @@ static int closed_count = 0;
 static void notebook_create_new_tab(const char* uri);
 static WebKitWebView* current_view(void);
 static void session_save(void);
+static void update_status(void);
 
 /* ---------------------------------------------------------------- URI load */
 static void load_uri(WebKitWebView* view, const char* uri)
@@ -140,6 +152,69 @@ static WebKitWebView* current_view(void)
     return page ? WEBKIT_WEB_VIEW(page) : NULL;
 }
 
+/* ----------------------------------- status bar (link hover + load progress) */
+static void update_status(void)
+{
+    gtk_label_set_text(status_label, status_link ? status_link : "");
+    gtk_widget_set_visible(GTK_WIDGET(status_label), status_link != NULL);
+    gtk_widget_set_visible(GTK_WIDGET(progress), page_loading);
+    gtk_widget_set_visible(statusbar, status_link != NULL || page_loading);
+}
+
+/* NULL clears it; ignored for background tabs so they can't hijack the status. */
+static void status_set_link(WebKitWebView* view, const char* uri)
+{
+    if (view != current_view())
+        return;
+    g_clear_pointer(&status_link, g_free);
+    if (uri != NULL && uri[0] != '\0')
+        status_link = g_strdup(uri);
+    update_status();
+}
+
+/* Report the focused link (keyboard tabbing) the way hover reports it. */
+static const char* LINK_FOCUS_JS =
+    "document.addEventListener('focusin',function(e){"
+    "var a=e.target.closest?e.target.closest('a[href]'):null;"
+    "window.webkit.messageHandlers.linkFocus.postMessage(a?a.href:'');},true);"
+    "document.addEventListener('focusout',function(){"
+    "window.webkit.messageHandlers.linkFocus.postMessage('');},true);";
+
+static void on_load_progress(GObject* obj, GParamSpec* pspec, gpointer data)
+{
+    WebKitWebView* view = WEBKIT_WEB_VIEW(obj);
+    if (view != current_view())
+        return;
+    gtk_progress_bar_set_fraction(progress, webkit_web_view_get_estimated_load_progress(view));
+}
+
+static void on_load_changed(WebKitWebView* view, WebKitLoadEvent event, gpointer data)
+{
+    if (view != current_view())
+        return;
+    if (event == WEBKIT_LOAD_STARTED) {
+        page_loading = TRUE;
+        gtk_progress_bar_set_fraction(progress, 0.0);
+    } else if (event == WEBKIT_LOAD_FINISHED) {
+        page_loading = FALSE;
+    }
+    update_status();
+}
+
+static void on_mouse_target(WebKitWebView* view, WebKitHitTestResult* hit, guint modifiers, gpointer data)
+{
+    status_set_link(view, webkit_hit_test_result_context_is_link(hit)
+            ? webkit_hit_test_result_get_link_uri(hit)
+            : NULL);
+}
+
+static void on_link_focus_message(WebKitUserContentManager* ucm, JSCValue* value, gpointer data)
+{
+    char* uri = jsc_value_to_string(value);
+    status_set_link(WEBKIT_WEB_VIEW(data), uri);
+    g_free(uri);
+}
+
 /* ----------------------------------------------------------------- tabs */
 /* Switch on press (capture phase) rather than on the button's release-driven
  * "clicked", so mouse selection feels as instant as the keyboard. */
@@ -173,6 +248,14 @@ static void on_switch_page(GtkNotebook* nb, GtkWidget* page, guint n, gpointer d
     GtkWidget* btn = g_object_get_data(G_OBJECT(page), "button");
     if (btn != NULL)
         gtk_widget_add_css_class(btn, "active");
+
+    /* Resync the status bar to the now-current tab. */
+    WebKitWebView* view = WEBKIT_WEB_VIEW(page);
+    g_clear_pointer(&status_link, g_free); /* no hover/focus on the new tab yet */
+    page_loading = webkit_web_view_is_loading(view);
+    if (page_loading)
+        gtk_progress_bar_set_fraction(progress, webkit_web_view_get_estimated_load_progress(view));
+    update_status();
 }
 
 static void on_counted_matches(WebKitFindController* fc, guint count, gpointer data);
@@ -251,6 +334,18 @@ static WebKitWebView* append_tab(void)
     g_signal_connect(view, "decide-policy", G_CALLBACK(on_decide_policy), NULL);
     g_signal_connect(view, "notify::favicon", G_CALLBACK(on_favicon_notify), NULL);
     g_signal_connect(webkit_web_view_get_find_controller(view), "counted-matches", G_CALLBACK(on_counted_matches), NULL);
+
+    g_signal_connect(view, "notify::estimated-load-progress", G_CALLBACK(on_load_progress), NULL);
+    g_signal_connect(view, "load-changed", G_CALLBACK(on_load_changed), NULL);
+    g_signal_connect(view, "mouse-target-changed", G_CALLBACK(on_mouse_target), NULL);
+
+    WebKitUserContentManager* ucm = webkit_web_view_get_user_content_manager(view);
+    webkit_user_content_manager_register_script_message_handler(ucm, "linkFocus", NULL);
+    g_signal_connect(ucm, "script-message-received::linkFocus", G_CALLBACK(on_link_focus_message), view);
+    WebKitUserScript* script = webkit_user_script_new(LINK_FOCUS_JS,
+        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
+    webkit_user_content_manager_add_script(ucm, script);
+    webkit_user_script_unref(script);
 
     int n = gtk_notebook_append_page(notebook, GTK_WIDGET(view), NULL);
     gtk_notebook_set_current_page(notebook, n);
@@ -365,11 +460,13 @@ static gboolean session_restore(void)
 }
 
 /* ----------------------------------------------------------------- modal */
-static void clear_box(GtkBox* box)
+/* modal_results shares a box with modal_entry1 (entry first, then the bookmark
+ * rows) so the box's spacing only appears when rows exist. Clear the rows only. */
+static void clear_results(void)
 {
     GtkWidget* c;
-    while ((c = gtk_widget_get_first_child(GTK_WIDGET(box))) != NULL)
-        gtk_box_remove(box, c);
+    while ((c = gtk_widget_get_last_child(GTK_WIDGET(modal_results))) != GTK_WIDGET(modal_entry1))
+        gtk_box_remove(modal_results, c);
 }
 
 static void modal_hide(void)
@@ -378,7 +475,7 @@ static void modal_hide(void)
     gtk_widget_set_visible(dim, FALSE);
     gtk_widget_set_visible(modal_box, FALSE);
     gtk_entry_set_attributes(modal_entry1, NULL);
-    clear_box(modal_results);
+    clear_results();
     fuzzy_count = 0;
     fuzzy_sel = -1;
 }
@@ -390,7 +487,7 @@ static void modal_show(ModalMode mode, gboolean open_new_tab)
     modal_blocked = FALSE;
     fuzzy_count = 0;
     fuzzy_sel = -1;
-    clear_box(modal_results);
+    clear_results();
     gtk_entry_set_attributes(modal_entry1, NULL);
     gtk_widget_set_visible(GTK_WIDGET(modal_entry1), TRUE);
     gtk_widget_set_visible(GTK_WIDGET(modal_info), FALSE); /* only shown for "Tab limit reached" */
@@ -416,7 +513,7 @@ static void modal_show(ModalMode mode, gboolean open_new_tab)
 static void modal_restyle_results(void)
 {
     int i = 0;
-    for (GtkWidget* c = gtk_widget_get_first_child(GTK_WIDGET(modal_results)); c != NULL; c = gtk_widget_get_next_sibling(c), i++) {
+    for (GtkWidget* c = gtk_widget_get_next_sibling(GTK_WIDGET(modal_entry1)); c != NULL; c = gtk_widget_get_next_sibling(c), i++) {
         if (i == fuzzy_sel)
             gtk_widget_add_css_class(c, "selected");
         else
@@ -477,7 +574,7 @@ static void on_search_changed(GtkEditable* editable, gpointer data)
     pango_attr_list_unref(attrs);
 
     /* Fuzzy-match bookmarks once 2+ chars are typed and there's no leader. */
-    clear_box(modal_results);
+    clear_results();
     fuzzy_count = 0;
     fuzzy_sel = -1;
     if (ll == 0)
@@ -743,44 +840,32 @@ static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval
     return FALSE;
 }
 
-/* ---------------------------------------------------- system dark/light */
-/* Follow the desktop's GSettings `color-scheme` live: set
- * gtk-application-prefer-dark-theme, which is all WebKit (and GTK) need to flip
- * dark/light. Same approach as the AGS sideview. */
+/* --------------------------------------------------------------- theme */
+/* Chrome stays pinned to THEME_NAME (always dark); only the website's
+ * prefers-color-scheme follows the system, via gtk-application-prefer-dark-theme. */
 static GSettings* iface_settings = NULL;
 
-static void apply_system_theme(void)
+static void apply_color_scheme(void)
 {
-    if (iface_settings == NULL)
-        return;
     char* scheme = g_settings_get_string(iface_settings, "color-scheme");
     g_object_set(gtk_settings_get_default(),
         "gtk-application-prefer-dark-theme", g_strcmp0(scheme, "prefer-dark") == 0, NULL);
     g_free(scheme);
 }
 
-static void on_interface_changed(GSettings* s, const char* key, gpointer data)
-{
-    apply_system_theme();
-}
-
-static void setup_color_scheme(void)
+static void setup_theme(void)
 {
     GSettingsSchemaSource* src = g_settings_schema_source_get_default();
     if (src == NULL)
         return;
     GSettingsSchema* schema = g_settings_schema_source_lookup(src, "org.gnome.desktop.interface", TRUE);
     if (schema == NULL)
-        return; /* schema not installed: leave GTK's own defaults in place */
-    gboolean ok = g_settings_schema_has_key(schema, "gtk-theme") && g_settings_schema_has_key(schema, "color-scheme");
+        return; /* this check ONLY needed for development!!!! nix develop */
     g_settings_schema_unref(schema);
-    if (!ok)
-        return;
 
     iface_settings = g_settings_new("org.gnome.desktop.interface");
-    apply_system_theme();
-    g_signal_connect(iface_settings, "changed::gtk-theme", G_CALLBACK(on_interface_changed), NULL);
-    g_signal_connect(iface_settings, "changed::color-scheme", G_CALLBACK(on_interface_changed), NULL);
+    apply_color_scheme();
+    g_signal_connect(iface_settings, "changed::color-scheme", G_CALLBACK(apply_color_scheme), NULL);
 }
 
 /* ------------------------------------------------------------------ build */
@@ -792,7 +877,7 @@ static void build_modal(void)
     gtk_widget_set_visible(dim, FALSE);
     gtk_overlay_add_overlay(overlay, dim);
 
-    modal_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    modal_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6); /* gap between name + url entries */
     gtk_widget_add_css_class(modal_box, "modal");
     gtk_widget_set_halign(modal_box, GTK_ALIGN_CENTER);
     gtk_widget_set_valign(modal_box, GTK_ALIGN_CENTER);
@@ -803,12 +888,14 @@ static void build_modal(void)
     modal_entry1 = GTK_ENTRY(gtk_entry_new());
     modal_entry2 = GTK_ENTRY(gtk_entry_new());
     gtk_widget_set_visible(GTK_WIDGET(modal_entry2), FALSE);
-    modal_results = GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL, 0));
+    /* Entry + bookmark rows share one box (spacing 4) so the gap shows only
+     * between present children — no dangling space under the entry when empty. */
+    modal_results = GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL, 4));
+    gtk_box_append(modal_results, GTK_WIDGET(modal_entry1));
 
     gtk_box_append(GTK_BOX(modal_box), GTK_WIDGET(modal_info));
-    gtk_box_append(GTK_BOX(modal_box), GTK_WIDGET(modal_entry1));
-    gtk_box_append(GTK_BOX(modal_box), GTK_WIDGET(modal_entry2));
     gtk_box_append(GTK_BOX(modal_box), GTK_WIDGET(modal_results));
+    gtk_box_append(GTK_BOX(modal_box), GTK_WIDGET(modal_entry2));
 
     g_signal_connect(modal_entry1, "changed", G_CALLBACK(on_search_changed), NULL);
     g_signal_connect(modal_entry1, "activate", G_CALLBACK(on_modal_activate), NULL);
@@ -885,10 +972,34 @@ static void ensure_window(void)
 
     tabbar = GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL, 0));
     gtk_widget_add_css_class(GTK_WIDGET(tabbar), "tabbar");
+    gtk_box_set_spacing(tabbar, 4);
+
+    /* Status label (hugs its text) over a thin progress bar, floated at the bottom
+     * of the webview so only the label's own background shows, not a full-width bar. */
+    status_label = GTK_LABEL(gtk_label_new(""));
+    gtk_label_set_xalign(status_label, 0.0);
+    gtk_label_set_ellipsize(status_label, PANGO_ELLIPSIZE_END);
+    gtk_widget_set_halign(GTK_WIDGET(status_label), GTK_ALIGN_START);
+
+    progress = GTK_PROGRESS_BAR(gtk_progress_bar_new());
+    gtk_widget_add_css_class(GTK_WIDGET(progress), "loadbar");
+
+    statusbar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_add_css_class(statusbar, "statusbar");
+    gtk_widget_set_valign(statusbar, GTK_ALIGN_END);
+    gtk_widget_set_can_target(statusbar, FALSE); /* clicks fall through to the page */
+    gtk_widget_set_visible(statusbar, FALSE);
+    gtk_box_append(GTK_BOX(statusbar), GTK_WIDGET(status_label));
+    gtk_box_append(GTK_BOX(statusbar), GTK_WIDGET(progress));
+
+    GtkWidget* content = gtk_overlay_new();
+    gtk_widget_set_hexpand(content, TRUE);
+    gtk_overlay_set_child(GTK_OVERLAY(content), GTK_WIDGET(notebook));
+    gtk_overlay_add_overlay(GTK_OVERLAY(content), statusbar);
 
     GtkWidget* hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_box_append(GTK_BOX(hbox), GTK_WIDGET(tabbar));
-    gtk_box_append(GTK_BOX(hbox), GTK_WIDGET(notebook));
+    gtk_box_append(GTK_BOX(hbox), content);
 
     overlay = GTK_OVERLAY(gtk_overlay_new());
     gtk_overlay_set_child(overlay, hbox);
@@ -902,7 +1013,7 @@ static void ensure_window(void)
     g_signal_connect(keys, "key-pressed", G_CALLBACK(handle_signal_keypress), NULL);
     gtk_widget_add_controller(GTK_WIDGET(window), keys);
 
-    setup_color_scheme();
+    setup_theme();
     /* No tab is created here: the caller paints the window/modal first, then warms
      * the web process on idle, so the search box appears without waiting on WebKit. */
 }

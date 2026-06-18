@@ -36,7 +36,7 @@
           buildInputs = (with pkgs; [
             glib
             glib-networking
-            gsettings-desktop-schemas # color scheme
+            gsettings-desktop-schemas # color-scheme (website light/dark follows system)
             gtk4
             webkitgtk_6_0
           ]) ++ gstPlugins;

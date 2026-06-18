@@ -9,6 +9,7 @@
 #define TAB_ICON_SIZE 24 // px, favicon size in the vertical tab strip
 #define SCROLL_STEP_PX 100 // px scrolled per mouse-wheel notch (0 = WebKit default)
 #define SEARCH "https://bing.com/search?q=%s"
+#define THEME_NAME "Graphite-nord-dark" // GTK UI theme; the UI is always dark
 
 #define DATA_DIR "/home/alec/.config/lightbrowse"
 #define BOOKMARKS_DIR DATA_DIR "/bookmarks"
@@ -37,7 +38,7 @@
     "enable-smooth-scrolling", true, \
     "default-charset", "utf-8"
 
-#define GTK_SETTINGS_CONFIG_H "gtk-enable-animations", false
+#define GTK_SETTINGS_CONFIG_H "gtk-enable-animations", true
 #define KEY(x) GDK_KEY_##x
 #define SFT  1 << 0
 #define CTRL 1 << 2
