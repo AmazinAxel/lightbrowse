@@ -23,7 +23,9 @@ static const char* CSS =
 
     ".statusbar label { color: @theme_fg_color; font-size: 0.85em; padding: 2px 4px; background: shade(@theme_bg_color, 1.2); border-top-right-radius: 6px; }"
     "progressbar.loadbar trough { border: none; background: transparent; border-radius: 0; padding: 0; min-height: 3px; }"
-    "progressbar.loadbar progress { border: none; border-radius: 0; background: #5e81ac; }";
+    "progressbar.loadbar progress { border: none; border-radius: 0; background: #5e81ac; }"
+    "progressbar.downloadbar trough { border: none; background: transparent; border-radius: 0; padding: 0; min-height: 3px; }"
+    "progressbar.downloadbar progress { border: none; border-radius: 0; background: #a3be8c; }";
 
 /* Global widgets */
 static GtkWindow* window;
@@ -59,6 +61,8 @@ static guint find_current = 0;
 static GtkWidget* statusbar;       /* container: hidden unless loading or hovering */
 static GtkLabel* status_label;     /* hovered or keyboard-focused link */
 static GtkProgressBar* progress;   /* page load progress (hidden when idle) */
+static GtkProgressBar* download_progress; /* green download progress, below the load bar */
+static int active_downloads = 0;
 static char* status_link = NULL;   /* hovered or keyboard-focused link URI */
 static char* status_flash = NULL;  /* transient message (e.g. "Download started") */
 static guint status_flash_source = 0;
@@ -163,7 +167,7 @@ static void update_status(void)
     gtk_label_set_text(status_label, text ? text : "");
     gtk_widget_set_visible(GTK_WIDGET(status_label), text != NULL);
     gtk_widget_set_visible(GTK_WIDGET(progress), page_loading);
-    gtk_widget_set_visible(statusbar, text != NULL || page_loading);
+    gtk_widget_set_visible(statusbar, text != NULL || page_loading || active_downloads > 0);
 }
 
 static gboolean status_flash_clear(gpointer data)
@@ -186,30 +190,55 @@ static void status_flash_message(const char* msg)
 }
 
 /* ----------------------------------------------------------------- downloads */
-/* Pick the destination path under ~/Downloads, uniquifying on collision so an
- * existing "file.zip" becomes "file (1).zip" rather than being clobbered. */
+/* Pick the destination path under DOWNLOADS_DIR, uniquifying on collision so an
+ * existing "file.zip" becomes "file (1).zip", "file (2).zip", ... rather than
+ * being clobbered. An already-numbered "file (1).zip" renumbers to "file (2).zip"
+ * instead of growing into "file (1) (1).zip". */
 static gboolean on_download_destination(WebKitDownload* download, gchar* suggested_filename, gpointer data)
 {
-    const char* xdg = g_get_user_special_dir(G_USER_DIRECTORY_DOWNLOAD);
-    char* dir = xdg ? g_strdup(xdg) : g_build_filename(g_get_home_dir(), "Downloads", NULL);
-    g_mkdir_with_parents(dir, 0700);
-
     const char* base = (suggested_filename != NULL && suggested_filename[0] != '\0')
         ? suggested_filename : "download";
-    char* dest = g_build_filename(dir, base, NULL);
+
     const char* ext = strrchr(base, '.'); /* keep the extension when numbering */
     int stem_len = ext ? (int)(ext - base) : (int)strlen(base);
+
+    /* Strip a trailing " (N)" from the stem so we renumber rather than append. */
+    if (stem_len >= 4 && base[stem_len - 1] == ')') {
+        int j = stem_len - 2;
+        while (j > 0 && g_ascii_isdigit(base[j]))
+            j -= 1;
+        if (j >= 1 && j <= stem_len - 3 && base[j] == '(' && base[j - 1] == ' ')
+            stem_len = j - 1;
+    }
+
+    char* dest = g_build_filename(DOWNLOADS_DIR, base, NULL);
     for (int i = 1; g_file_test(dest, G_FILE_TEST_EXISTS); i++) {
         g_free(dest);
         char* name = g_strdup_printf("%.*s (%d)%s", stem_len, base, i, ext ? ext : "");
-        dest = g_build_filename(dir, name, NULL);
+        dest = g_build_filename(DOWNLOADS_DIR, name, NULL);
         g_free(name);
     }
 
     webkit_download_set_destination(download, dest);
     g_free(dest);
-    g_free(dir);
     return TRUE;
+}
+
+static void on_download_progress(GObject* obj, GParamSpec* pspec, gpointer data)
+{
+    gtk_progress_bar_set_fraction(download_progress,
+        webkit_download_get_estimated_progress(WEBKIT_DOWNLOAD(obj)));
+}
+
+/* "finished" fires on success, cancel, and after "failed" alike, so it's the one
+ * place to drop the active count and hide the bar once nothing is downloading. */
+static void on_download_finished(WebKitDownload* download, gpointer data)
+{
+    if (active_downloads > 0)
+        active_downloads -= 1;
+    if (active_downloads == 0)
+        gtk_widget_set_visible(GTK_WIDGET(download_progress), FALSE);
+    update_status();
 }
 
 /* A download opened in a fresh tab (target=_blank / window.open) leaves that tab
@@ -234,6 +263,12 @@ static gboolean close_blank_download_tab(gpointer data)
 static void on_download_started(WebKitNetworkSession* session, WebKitDownload* download, gpointer data)
 {
     g_signal_connect(download, "decide-destination", G_CALLBACK(on_download_destination), NULL);
+    g_signal_connect(download, "notify::estimated-progress", G_CALLBACK(on_download_progress), NULL);
+    g_signal_connect(download, "finished", G_CALLBACK(on_download_finished), NULL);
+
+    active_downloads += 1;
+    gtk_progress_bar_set_fraction(download_progress, 0.0);
+    gtk_widget_set_visible(GTK_WIDGET(download_progress), TRUE);
     status_flash_message("Download started");
 
     WebKitWebView* view = webkit_download_get_web_view(download);
@@ -365,6 +400,17 @@ static gboolean on_view_scroll(GtkEventControllerScroll* c, double dx, double dy
 static gboolean on_decide_policy(WebKitWebView* view, WebKitPolicyDecision* decision,
     WebKitPolicyDecisionType type, gpointer data)
 {
+    /* A response WebKit can't render (zip, exe, ...) should download, not show a
+     * blank page. WebKit doesn't do this on its own, so force it here. */
+    if (type == WEBKIT_POLICY_DECISION_TYPE_RESPONSE) {
+        if (!webkit_response_policy_decision_is_mime_type_supported(
+                WEBKIT_RESPONSE_POLICY_DECISION(decision))) {
+            webkit_policy_decision_download(decision);
+            return TRUE;
+        }
+        return FALSE;
+    }
+
     if (type != WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION)
         return FALSE;
     WebKitNavigationAction* a = webkit_navigation_policy_decision_get_navigation_action(
@@ -1068,6 +1114,10 @@ static void ensure_window(void)
     progress = GTK_PROGRESS_BAR(gtk_progress_bar_new());
     gtk_widget_add_css_class(GTK_WIDGET(progress), "loadbar");
 
+    download_progress = GTK_PROGRESS_BAR(gtk_progress_bar_new());
+    gtk_widget_add_css_class(GTK_WIDGET(download_progress), "downloadbar");
+    gtk_widget_set_visible(GTK_WIDGET(download_progress), FALSE);
+
     statusbar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_widget_add_css_class(statusbar, "statusbar");
     gtk_widget_set_valign(statusbar, GTK_ALIGN_END);
@@ -1075,6 +1125,7 @@ static void ensure_window(void)
     gtk_widget_set_visible(statusbar, FALSE);
     gtk_box_append(GTK_BOX(statusbar), GTK_WIDGET(status_label));
     gtk_box_append(GTK_BOX(statusbar), GTK_WIDGET(progress));
+    gtk_box_append(GTK_BOX(statusbar), GTK_WIDGET(download_progress));
 
     GtkWidget* content = gtk_overlay_new();
     gtk_widget_set_hexpand(content, TRUE);

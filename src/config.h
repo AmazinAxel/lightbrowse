@@ -14,6 +14,7 @@
 #define DATA_DIR "/home/alec/.config/lightbrowse"
 #define BOOKMARKS_DIR DATA_DIR "/bookmarks"
 #define SESSION_FILE DATA_DIR "/session" // open tab URLs, restored on next launch
+#define DOWNLOADS_DIR "/home/alec/Downloads" // saved downloads (assumed to exist)
 
 /* Runtime asset directory.
  * The Nix package overrides this at build time (-DLIGHTBROWSE_SHARE_DIR=...)
