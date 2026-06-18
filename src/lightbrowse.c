@@ -209,6 +209,12 @@ static WebKitWebView* append_tab(void)
         "web-context", get_shared_web_context(),
         NULL);
     NULLCHECK(view);
+
+    webkit_settings_set_user_agent(get_shared_settings(),
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+        "Version/26.0 Safari/605.1.15");
+
     apply_bg(view);
 
     GtkWidget* img = gtk_image_new();
