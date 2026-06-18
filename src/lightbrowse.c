@@ -152,6 +152,12 @@ static WebKitWebView* current_view(void)
 static void apply_bg(WebKitWebView* view)
 {
     webkit_web_view_set_background_color(view, dark_mode ? &NORD_DARK : &NORD_LIGHT);
+    /* WebKit re-reads prefers-color-scheme during the webview's own style
+     * recompute, so force a real class change on it — toggling lb-dark/lb-light
+     * on the window alone doesn't restyle the webview (no rule targets it), and
+     * the page would otherwise only update on a manual reload. */
+    gtk_widget_add_css_class(GTK_WIDGET(view), dark_mode ? "lb-dark" : "lb-light");
+    gtk_widget_remove_css_class(GTK_WIDGET(view), dark_mode ? "lb-light" : "lb-dark");
 }
 
 static void update_all_backgrounds(void)
