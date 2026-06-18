@@ -54,6 +54,23 @@ on_send_request(WebKitWebPage* page,
 }
 
 /*
+ * Compile the filter list lazily, off the web-process startup path.
+ *
+ * The combined EasyList is large and compiling a regex per rule takes a noticeable
+ * chunk of time. Doing it here (at the next main-loop idle) instead of inside
+ * initialize() means the first navigation isn't blocked waiting for it; requests
+ * that arrive before it finishes simply pass through unfiltered
+ * (adblock_uri_tester_test_uri returns FALSE until tester->loaded is set).
+ */
+static gboolean
+load_filters_idle(gpointer user_data G_GNUC_UNUSED)
+{
+    adblock_uri_tester_load(tester);
+    g_debug("[lightbrowse-adblock] Loaded filters from %s", ADBLOCK_FILTERLIST_PATH);
+    return G_SOURCE_REMOVE;
+}
+
+/*
  * Called when a new web page is created.
  * We connect to the send-request signal to intercept all resource requests.
  */
@@ -98,11 +115,10 @@ webkit_web_process_extension_initialize_with_user_data(WebKitWebProcessExtension
         return;
     }
 
-    /* Initialize the URI tester and load filters */
+    /* Create the tester now but compile the filters at the next idle, so the
+     * first page load isn't blocked behind the (large) list compile. */
     tester = adblock_uri_tester_new(ADBLOCK_FILTERLIST_PATH);
-    adblock_uri_tester_load(tester);
-
-    g_debug("[lightbrowse-adblock] Loaded filters from %s", ADBLOCK_FILTERLIST_PATH);
+    g_idle_add(load_filters_idle, NULL);
 
     /* Connect to page-created to hook into each new page */
     g_signal_connect(extension, "page-created", G_CALLBACK(on_page_created), NULL);

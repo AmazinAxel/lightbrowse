@@ -7,6 +7,7 @@
 #define CLOSED_TAB_HISTORY 3 // how many closed tabs can be reopened (ctrl+shift+t)
 #define FUZZY_RESULTS 3 // max bookmark suggestions shown in the search modal
 #define TAB_ICON_SIZE 24 // px, favicon size in the vertical tab strip
+#define SCROLL_STEP_PX 100 // px scrolled per mouse-wheel notch (0 = WebKit default)
 #define SEARCH "https://bing.com/search?q=%s"
 
 #define DATA_DIR "/home/alec/.config/lightbrowse"
@@ -87,9 +88,9 @@ static struct {
     func id;
 } shortcut[] = {
     { CTRL,        KEY(h),             goback               },
-    { CTRL,        KEY(Left),          goback               },
+    { ALT,         KEY(Left),          goback               },
     { CTRL,        KEY(j),             goforward            },
-    { CTRL,        KEY(Right),         goforward            },
+    { ALT,         KEY(Right),         goforward            },
 
     { CTRL,        KEY(r),             refresh              },
     { CTRL,        KEY(R),             refresh_force        },

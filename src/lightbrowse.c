@@ -97,6 +97,9 @@ static WebKitWebContext* get_shared_web_context(void)
     static WebKitWebContext* context = NULL;
     if (context == NULL) {
         context = webkit_web_context_new();
+        /* Most aggressive caching: "improve document load speed substantially by
+         * caching a very large number of resources and previously viewed content." */
+        webkit_web_context_set_cache_model(context, WEBKIT_CACHE_MODEL_WEB_BROWSER);
         if (ADBLOCK_ENABLED) {
             webkit_web_context_set_web_process_extensions_directory(context, ADBLOCK_EXTENSIONS_DIR);
             GVariantBuilder builder;
@@ -175,6 +178,41 @@ static void on_switch_page(GtkNotebook* nb, GtkWidget* page, guint n, gpointer d
 static void on_counted_matches(WebKitFindController* fc, guint count, gpointer data);
 static GtkWidget* on_create_tab(WebKitWebView* self, WebKitNavigationAction* action, gpointer data);
 
+/* Bigger mouse-wheel steps: WebKit's default wheel scroll barely moves the page.
+ * On a wheel notch, scroll the hovered element (or the page) by SCROLL_STEP_PX
+ * and consume the native event. Touchpad / smooth scrolling passes through. The
+ * `:hover` chain gives the element under the cursor without tracking the pointer. */
+static gboolean on_view_scroll(GtkEventControllerScroll* c, double dx, double dy, gpointer data)
+{
+    if (SCROLL_STEP_PX == 0 || gtk_event_controller_scroll_get_unit(c) != GDK_SCROLL_UNIT_WHEEL)
+        return FALSE; /* let touchpad / smooth scrolling through */
+
+    char* js = g_strdup_printf(
+        "(function(dx,dy){var h=document.querySelectorAll(':hover'),e=h[h.length-1];"
+        "while(e){var s=getComputedStyle(e);"
+        "if(e.scrollHeight>e.clientHeight&&/auto|scroll/.test(s.overflowY)){e.scrollBy(dx,dy);return;}"
+        "e=e.parentElement;}window.scrollBy(dx,dy);})(%f,%f);",
+        dx * SCROLL_STEP_PX, dy * SCROLL_STEP_PX);
+    webkit_web_view_evaluate_javascript(WEBKIT_WEB_VIEW(data), js, -1, NULL, NULL, NULL, NULL, NULL);
+    g_free(js);
+    return TRUE; /* consume so WebKit doesn't also scroll */
+}
+
+/* Middle-click a link -> open it in a new tab (other clicks navigate normally). */
+static gboolean on_decide_policy(WebKitWebView* view, WebKitPolicyDecision* decision,
+    WebKitPolicyDecisionType type, gpointer data)
+{
+    if (type != WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION)
+        return FALSE;
+    WebKitNavigationAction* a = webkit_navigation_policy_decision_get_navigation_action(
+        WEBKIT_NAVIGATION_POLICY_DECISION(decision));
+    if (webkit_navigation_action_get_mouse_button(a) != 2) /* 2 = middle */
+        return FALSE;
+    notebook_create_new_tab(webkit_uri_request_get_uri(webkit_navigation_action_get_request(a)));
+    webkit_policy_decision_ignore(decision);
+    return TRUE;
+}
+
 static WebKitWebView* append_tab(void)
 {
     WebKitWebView* view = g_object_new(WEBKIT_TYPE_WEB_VIEW,
@@ -204,7 +242,13 @@ static WebKitWebView* append_tab(void)
     gtk_widget_add_controller(btn, GTK_EVENT_CONTROLLER(click));
     gtk_box_append(tabbar, btn);
 
+    GtkEventController* scroll = gtk_event_controller_scroll_new(GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
+    gtk_event_controller_set_propagation_phase(scroll, GTK_PHASE_CAPTURE);
+    g_signal_connect(scroll, "scroll", G_CALLBACK(on_view_scroll), view);
+    gtk_widget_add_controller(GTK_WIDGET(view), scroll);
+
     g_signal_connect(view, "create", G_CALLBACK(on_create_tab), NULL);
+    g_signal_connect(view, "decide-policy", G_CALLBACK(on_decide_policy), NULL);
     g_signal_connect(view, "notify::favicon", G_CALLBACK(on_favicon_notify), NULL);
     g_signal_connect(webkit_web_view_get_find_controller(view), "counted-matches", G_CALLBACK(on_counted_matches), NULL);
 
@@ -309,19 +353,15 @@ static gboolean session_restore(void)
     char** lines = g_strsplit(contents, "\n", -1);
     g_free(contents);
 
-    gboolean first = TRUE;
+    gboolean any = FALSE;
     for (char** l = lines; *l != NULL; l++) {
         if ((*l)[0] == '\0')
             continue;
-        if (first) {
-            load_uri(current_view(), *l); /* reuse the initial blank tab */
-            first = FALSE;
-        } else {
-            notebook_create_new_tab(*l);
-        }
+        notebook_create_new_tab(*l);
+        any = TRUE;
     }
     g_strfreev(lines);
-    return !first; /* first stays TRUE only if nothing was restored */
+    return any;
 }
 
 /* ----------------------------------------------------------------- modal */
@@ -396,6 +436,24 @@ static void modal_move_sel(int dir)
     modal_restyle_results();
 }
 
+/* Speculative DNS: as soon as the typed text looks like a host, resolve it so
+ * the lookup is already done (or in flight) by the time Enter fires. WebKit dedups
+ * repeats, so calling it on each keystroke is cheap. */
+static void prefetch_host(const char* text)
+{
+    const char* p = strstr(text, "://");
+    p = p ? p + 3 : text;
+    if (strchr(p, ' ') != NULL || strchr(p, '.') == NULL)
+        return; /* not a bare host (a search query or a shortcut) */
+    const char* end = strchr(p, '/');
+    gsize len = end ? (gsize)(end - p) : strlen(p);
+    if (len == 0 || len > 253)
+        return;
+    char* host = g_strndup(p, len);
+    webkit_network_session_prefetch_dns(get_shared_network_session(), host);
+    g_free(host);
+}
+
 static void on_search_changed(GtkEditable* editable, gpointer data)
 {
     if (modal_mode != MODAL_SEARCH)
@@ -422,6 +480,8 @@ static void on_search_changed(GtkEditable* editable, gpointer data)
     clear_box(modal_results);
     fuzzy_count = 0;
     fuzzy_sel = -1;
+    if (ll == 0)
+        prefetch_host(text); /* warm DNS for a directly-typed host */
     if (ll == 0 && strlen(text) >= 2) {
         const char* names[FUZZY_RESULTS];
         fuzzy_count = bookmarks_fuzzy(text, names, fuzzy_urls, FUZZY_RESULTS);
@@ -429,6 +489,7 @@ static void on_search_changed(GtkEditable* editable, gpointer data)
             GtkWidget* row = gtk_label_new(names[i]);
             gtk_label_set_xalign(GTK_LABEL(row), 0.0);
             gtk_box_append(modal_results, row);
+            prefetch_host(fuzzy_urls[i]); /* warm DNS for matching bookmarks */
         }
     }
 }
@@ -445,7 +506,7 @@ static void on_modal_activate(GtkEntry* entry, gpointer data)
             uri = fuzzy_urls[fuzzy_sel];
         else
             uri = gtk_editable_get_text(GTK_EDITABLE(modal_entry1));
-        if (modal_new_tab)
+        if (modal_new_tab || current_view() == NULL) /* no warm tab yet -> make one */
             notebook_create_new_tab(uri);
         else
             load_uri(current_view(), uri);
@@ -842,8 +903,16 @@ static void ensure_window(void)
     gtk_widget_add_controller(GTK_WIDGET(window), keys);
 
     setup_color_scheme();
+    /* No tab is created here: the caller paints the window/modal first, then warms
+     * the web process on idle, so the search box appears without waiting on WebKit. */
+}
 
-    notebook_create_new_tab(NULL); /* blank tab; spins up the web process */
+/* Spin up the web process once the window/modal has been shown. */
+static gboolean warm_blank_tab(gpointer data)
+{
+    if (notebook != NULL && gtk_notebook_get_n_pages(notebook) == 0)
+        notebook_create_new_tab(NULL);
+    return G_SOURCE_REMOVE;
 }
 
 /* Launched with no URL (or a second plain invocation): show the search modal. */
@@ -851,22 +920,20 @@ static void on_activate(GApplication* application, gpointer data)
 {
     gboolean fresh = (window == NULL);
     ensure_window();
-    if (fresh && !session_restore()) /* restore last tabs, else a blank search */
+    if (fresh && !session_restore()) { /* restore last tabs, else a blank search */
         modal_show(MODAL_SEARCH, FALSE);
+        g_idle_add(warm_blank_tab, NULL); /* paint the modal first, warm WebKit after */
+    }
     gtk_window_present(window);
 }
 
 /* Launched/activated with URLs (default-browser link handling). No modal. */
 static void on_open(GApplication* application, GFile** files, gint n_files, const char* hint, gpointer data)
 {
-    gboolean fresh = (window == NULL);
     ensure_window();
     for (gint i = 0; i < n_files; i++) {
         char* uri = g_file_get_uri(files[i]);
-        if (fresh && i == 0)
-            load_uri(current_view(), uri); /* reuse the initial blank tab */
-        else
-            notebook_create_new_tab(uri);
+        notebook_create_new_tab(uri);
         g_free(uri);
     }
     gtk_window_present(window);
