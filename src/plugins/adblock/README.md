@@ -21,9 +21,8 @@ The Nix flake at the repository root builds and wires this up automatically:
   `$out/share/lightbrowse/filterlist.txt`, and bakes that path into the
   extension via `-DADBLOCK_FILTERLIST_PATH`.
 
-The browser enables adblock through `config.h`:
+The browser configures adblock through `config.h`:
 
-- `ADBLOCK_ENABLED` — `true` to enable adblocking.
 - `ADBLOCK_FILTERLIST_PATH` — derived from `LIGHTBROWSE_SHARE_DIR`.
 - `ADBLOCK_EXTENSIONS_DIR` — derived from `LIGHTBROWSE_SHARE_DIR`.
 

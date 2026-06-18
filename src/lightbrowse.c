@@ -119,14 +119,12 @@ static WebKitWebContext* get_shared_web_context(void)
         /* Most aggressive caching: "improve document load speed substantially by
          * caching a very large number of resources and previously viewed content." */
         webkit_web_context_set_cache_model(context, WEBKIT_CACHE_MODEL_WEB_BROWSER);
-        if (ADBLOCK_ENABLED) {
-            webkit_web_context_set_web_process_extensions_directory(context, ADBLOCK_EXTENSIONS_DIR);
-            GVariantBuilder builder;
-            g_variant_builder_init(&builder, G_VARIANT_TYPE_VARDICT);
-            g_variant_builder_add(&builder, "{sv}", "enabled", g_variant_new_boolean(TRUE));
-            webkit_web_context_set_web_process_extensions_initialization_user_data(
-                context, g_variant_builder_end(&builder));
-        }
+        webkit_web_context_set_web_process_extensions_directory(context, ADBLOCK_EXTENSIONS_DIR);
+        GVariantBuilder builder;
+        g_variant_builder_init(&builder, G_VARIANT_TYPE_VARDICT);
+        g_variant_builder_add(&builder, "{sv}", "enabled", g_variant_new_boolean(TRUE));
+        webkit_web_context_set_web_process_extensions_initialization_user_data(
+            context, g_variant_builder_end(&builder));
     }
     return context;
 }
@@ -823,7 +821,7 @@ static void find_hide(void)
 /* ------------------------------------------------------------- shortcuts */
 static void handle_shortcut(func id)
 {
-    static double zoom = ZOOM_START_LEVEL;
+    static double zoom = 1.0;
     WebKitWebView* view = current_view();
 
     switch (id) {
@@ -846,7 +844,7 @@ static void handle_shortcut(func id)
             if (view) webkit_web_view_set_zoom_level(view, (zoom -= ZOOM_STEPSIZE));
             break;
         case zoom_reset:
-            if (view) webkit_web_view_set_zoom_level(view, (zoom = ZOOM_START_LEVEL));
+            if (view) webkit_web_view_set_zoom_level(view, (zoom = 1.0));
             break;
         case next_tab: {
             int n = gtk_notebook_get_n_pages(notebook);
@@ -908,7 +906,7 @@ static void handle_shortcut(func id)
             break;
         case reading_mode:
             /* Apply the reader transform (refresh the page to undo it). */
-            if (READABILITY_ENABLED && view) {
+            if (view) {
                 char* js = read_readability_js();
                 if (js != NULL) {
                     webkit_web_view_evaluate_javascript(view, js, -1, NULL, "lightbrowse-readability", NULL, NULL, NULL);
@@ -1081,7 +1079,7 @@ static void ensure_window(void)
 
     g_mkdir_with_parents(DATA_DIR, 0700);
     bookmarks_load(BOOKMARKS_DIR);
-    g_object_set(gtk_settings_get_default(), GTK_SETTINGS_CONFIG_H, NULL);
+    g_object_set(gtk_settings_get_default(), "gtk-enable-animations", true, NULL);
 
     GtkCssProvider* css = gtk_css_provider_new();
     gtk_css_provider_load_from_string(css, CSS);

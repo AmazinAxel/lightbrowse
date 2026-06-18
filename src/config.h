@@ -1,13 +1,12 @@
 #include <stdbool.h>
 #include <gtk/gtk.h>
 
-#define ZOOM_START_LEVEL 1.0
 #define ZOOM_STEPSIZE .1
 #define MAX_NUM_TABS 8 // 0 for inf tabs
 #define CLOSED_TAB_HISTORY 3 // how many closed tabs can be reopened (ctrl+shift+t)
 #define FUZZY_RESULTS 3 // max bookmark suggestions shown in the search modal
 #define TAB_ICON_SIZE 24 // px, favicon size in the vertical tab strip
-#define SCROLL_STEP_PX 100 // px scrolled per mouse-wheel notch (0 = WebKit default)
+#define SCROLL_STEP_PX 200 // px scrolled per mouse-wheel notch (0 = WebKit default)
 #define SEARCH "https://bing.com/search?q=%s"
 #define THEME_NAME "Graphite-nord-dark" // GTK UI theme; the UI is always dark
 
@@ -25,8 +24,6 @@
 #endif
 
 /* Plugins */
-#define READABILITY_ENABLED true
-#define ADBLOCK_ENABLED true
 #define ADBLOCK_EXTENSIONS_DIR LIGHTBROWSE_SHARE_DIR "/extensions"
 #define ADBLOCK_FILTERLIST_PATH LIGHTBROWSE_SHARE_DIR "/filterlist.txt"
 
@@ -39,7 +36,6 @@
     "enable-smooth-scrolling", true, \
     "default-charset", "utf-8"
 
-#define GTK_SETTINGS_CONFIG_H "gtk-enable-animations", true
 #define KEY(x) GDK_KEY_##x
 #define SFT  1 << 0
 #define CTRL 1 << 2
