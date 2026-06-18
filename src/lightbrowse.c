@@ -1,5 +1,6 @@
 #include <gdk/gdk.h>
 #include <gio/gio.h>
+#include <glib-unix.h>
 #include <glib/gstdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,11 +8,6 @@
 
 #include "config.h"
 #include "plugins/plugins.h"
-
-/* Nord base colours shown behind blank/transparent pages, per light/dark. */
-static const GdkRGBA NORD_DARK = { 0.180, 0.204, 0.251, 1.0 }; /* #2e3440 polar night */
-static const GdkRGBA NORD_LIGHT = { 0.925, 0.937, 0.957, 1.0 }; /* #eceff4 snow storm */
-static gboolean dark_mode = TRUE;
 
 static const char* CSS =
     ".tabbar { background: shade(@theme_bg_color, 1.2); border-right: 0.25rem solid #5e81ac; padding: 4px; }"
@@ -23,16 +19,7 @@ static const char* CSS =
     ".modal entry { min-width: 280px; }"
     ".modal label { margin: 3px 0; padding: 6px; }"
     ".modal .selected { background: #81A1C1; color: #ECEFF4; outline: 2px #5E81AC; border-radius: 4px; }"
-    ".findbar { background: @theme_bg_color; color: @theme_fg_color; border: 1px solid #5e81ac; border-radius: 8px; padding: 4px; margin-bottom: 12px; }"
-    /* Chrome colours follow light/dark via a root class (lb-dark / lb-light) set
-     * in apply_system_theme, so we never reload the system theme (which stalls the
-     * webview's color-scheme). Nord: polar night #2e3440/#3b4252, snow #eceff4/#e5e9f0. */
-    "window.lb-dark .tabbar { background: #3b4252; }"
-    "window.lb-light .tabbar { background: #e5e9f0; }"
-    "window.lb-dark .modal, window.lb-dark .findbar { background: #2e3440; color: #eceff4; }"
-    "window.lb-light .modal, window.lb-light .findbar { background: #eceff4; color: #2e3440; }"
-    "window.lb-dark .modal entry, window.lb-dark .findbar entry { background: #3b4252; color: #eceff4; }"
-    "window.lb-light .modal entry, window.lb-light .findbar entry { background: #ffffff; color: #2e3440; }";
+    ".findbar { background: @theme_bg_color; color: @theme_fg_color; border: 1px solid #5e81ac; border-radius: 8px; padding: 4px; margin-bottom: 12px; }";
 
 /* Global widgets */
 static GtkWindow* window;
@@ -71,6 +58,7 @@ static int closed_count = 0;
 /* Forward declarations */
 static void notebook_create_new_tab(const char* uri);
 static WebKitWebView* current_view(void);
+static void session_save(void);
 
 /* ---------------------------------------------------------------- URI load */
 static void load_uri(WebKitWebView* view, const char* uri)
@@ -149,26 +137,6 @@ static WebKitWebView* current_view(void)
     return page ? WEBKIT_WEB_VIEW(page) : NULL;
 }
 
-static void apply_bg(WebKitWebView* view)
-{
-    webkit_web_view_set_background_color(view, dark_mode ? &NORD_DARK : &NORD_LIGHT);
-    /* WebKit re-reads prefers-color-scheme during the webview's own style
-     * recompute, so force a real class change on it — toggling lb-dark/lb-light
-     * on the window alone doesn't restyle the webview (no rule targets it), and
-     * the page would otherwise only update on a manual reload. */
-    gtk_widget_add_css_class(GTK_WIDGET(view), dark_mode ? "lb-dark" : "lb-light");
-    gtk_widget_remove_css_class(GTK_WIDGET(view), dark_mode ? "lb-light" : "lb-dark");
-}
-
-static void update_all_backgrounds(void)
-{
-    if (notebook == NULL)
-        return;
-    int n = gtk_notebook_get_n_pages(notebook);
-    for (int i = 0; i < n; i++)
-        apply_bg(WEBKIT_WEB_VIEW(gtk_notebook_get_nth_page(notebook, i)));
-}
-
 /* ----------------------------------------------------------------- tabs */
 /* Switch on press (capture phase) rather than on the button's release-driven
  * "clicked", so mouse selection feels as instant as the keyboard. */
@@ -220,8 +188,6 @@ static WebKitWebView* append_tab(void)
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/605.1.15 (KHTML, like Gecko) "
         "Version/26.0 Safari/605.1.15");
-
-    apply_bg(view);
 
     GtkWidget* img = gtk_image_new();
     gtk_image_set_pixel_size(GTK_IMAGE(img), TAB_ICON_SIZE);
@@ -286,8 +252,10 @@ static void close_current_tab(void)
         gtk_box_remove(tabbar, btn);
     gtk_notebook_remove_page(notebook, gtk_notebook_get_current_page(notebook));
     num_tabs -= 1;
-    if (num_tabs <= 0) /* no homepage to fall back to: quit */
+    if (num_tabs <= 0) { /* no homepage to fall back to: quit */
+        session_save();  /* 0 tabs left -> clears the saved session */
         gtk_window_destroy(window);
+    }
 }
 
 static void reopen_closed_tab(void)
@@ -304,6 +272,56 @@ static void reopen_closed_tab(void)
     else
         load_uri(view, "about:blank");
     webkit_web_view_session_state_unref(st);
+}
+
+/* ------------------------------------------------------ session restore */
+/* Persist every open tab's URL to SESSION_FILE so the next cold start can bring
+ * them back. Called on window close and on SIGTERM (logout / poweroff). With no
+ * real tabs open it removes the file, so closing everything starts fresh. */
+static void session_save(void)
+{
+    if (notebook == NULL)
+        return;
+    GString* s = g_string_new(NULL);
+    int n = gtk_notebook_get_n_pages(notebook);
+    for (int i = 0; i < n; i++) {
+        WebKitWebView* v = WEBKIT_WEB_VIEW(gtk_notebook_get_nth_page(notebook, i));
+        const char* uri = webkit_web_view_get_uri(v);
+        if (uri == NULL || uri[0] == '\0' || g_str_has_prefix(uri, "about:"))
+            continue;
+        g_string_append(s, uri);
+        g_string_append_c(s, '\n');
+    }
+    if (s->len > 0)
+        g_file_set_contents(SESSION_FILE, s->str, s->len, NULL);
+    else
+        g_unlink(SESSION_FILE);
+    g_string_free(s, TRUE);
+}
+
+/* Reload the saved tabs into the freshly-built window (reusing its blank tab for
+ * the first URL). Returns TRUE if at least one tab was restored. */
+static gboolean session_restore(void)
+{
+    char* contents = NULL;
+    if (!g_file_get_contents(SESSION_FILE, &contents, NULL, NULL))
+        return FALSE;
+    char** lines = g_strsplit(contents, "\n", -1);
+    g_free(contents);
+
+    gboolean first = TRUE;
+    for (char** l = lines; *l != NULL; l++) {
+        if ((*l)[0] == '\0')
+            continue;
+        if (first) {
+            load_uri(current_view(), *l); /* reuse the initial blank tab */
+            first = FALSE;
+        } else {
+            notebook_create_new_tab(*l);
+        }
+    }
+    g_strfreev(lines);
+    return !first; /* first stays TRUE only if nothing was restored */
 }
 
 /* ----------------------------------------------------------------- modal */
@@ -665,14 +683,9 @@ static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval
 }
 
 /* ---------------------------------------------------- system dark/light */
-/* Follow the desktop's GSettings `color-scheme` live. We deliberately do ONLY
- * what the (working) AGS sideview does for the webview — set
- * gtk-application-prefer-dark-theme — and nothing else that restyles the GTK
- * tree, because reloading the system theme CSS makes WebKit stall on
- * prefers-color-scheme (page needs a manual reload). The browser chrome instead
- * carries its own Nord light/dark colours, switched by the lb-dark/lb-light
- * class on the window (see CSS), so it follows instantly without touching the
- * system theme. */
+/* Follow the desktop's GSettings `color-scheme` live: set
+ * gtk-application-prefer-dark-theme, which is all WebKit (and GTK) need to flip
+ * dark/light. Same approach as the AGS sideview. */
 static GSettings* iface_settings = NULL;
 
 static void apply_system_theme(void)
@@ -680,16 +693,9 @@ static void apply_system_theme(void)
     if (iface_settings == NULL)
         return;
     char* scheme = g_settings_get_string(iface_settings, "color-scheme");
-    dark_mode = g_strcmp0(scheme, "prefer-dark") == 0;
+    g_object_set(gtk_settings_get_default(),
+        "gtk-application-prefer-dark-theme", g_strcmp0(scheme, "prefer-dark") == 0, NULL);
     g_free(scheme);
-
-    g_object_set(gtk_settings_get_default(), "gtk-application-prefer-dark-theme", dark_mode, NULL);
-    update_all_backgrounds();
-
-    if (window != NULL) {
-        gtk_widget_add_css_class(GTK_WIDGET(window), dark_mode ? "lb-dark" : "lb-light");
-        gtk_widget_remove_css_class(GTK_WIDGET(window), dark_mode ? "lb-light" : "lb-dark");
-    }
 }
 
 static void on_interface_changed(GSettings* s, const char* key, gpointer data)
@@ -771,6 +777,22 @@ static void build_findbar(void)
 /* ------------------------------------------------------------ application */
 static GtkApplication* app;
 
+/* Window manager / sway close (the X): save the open tabs, then allow it. */
+static gboolean on_close_request(GtkWindow* w, gpointer data)
+{
+    session_save();
+    return FALSE;
+}
+
+/* SIGTERM/SIGINT (logout, poweroff, Ctrl-C): save the session and quit cleanly
+ * so tabs survive a shutdown. */
+static gboolean on_term_signal(gpointer data)
+{
+    session_save();
+    g_application_quit(G_APPLICATION(app));
+    return G_SOURCE_REMOVE;
+}
+
 /* Build the window, UI and one blank tab. Idempotent and runs one-time global
  * init on the first call; later calls (a second `open`/`activate` on the
  * already-running instance) are no-ops. */
@@ -792,6 +814,7 @@ static void ensure_window(void)
 
     window = GTK_WINDOW(gtk_application_window_new(app));
     gtk_window_set_default_size(window, 1100, 700); /* initial size only; never a resize limit */
+    g_signal_connect(window, "close-request", G_CALLBACK(on_close_request), NULL);
 
     notebook = GTK_NOTEBOOK(gtk_notebook_new());
     gtk_notebook_set_show_tabs(notebook, FALSE);
@@ -818,8 +841,6 @@ static void ensure_window(void)
     g_signal_connect(keys, "key-pressed", G_CALLBACK(handle_signal_keypress), NULL);
     gtk_widget_add_controller(GTK_WIDGET(window), keys);
 
-    /* After the window exists so apply_system_theme can set the lb-dark/lb-light
-     * class on it; also sets dark_mode before the first tab's background. */
     setup_color_scheme();
 
     notebook_create_new_tab(NULL); /* blank tab; spins up the web process */
@@ -830,7 +851,7 @@ static void on_activate(GApplication* application, gpointer data)
 {
     gboolean fresh = (window == NULL);
     ensure_window();
-    if (fresh)
+    if (fresh && !session_restore()) /* restore last tabs, else a blank search */
         modal_show(MODAL_SEARCH, FALSE);
     gtk_window_present(window);
 }
@@ -856,6 +877,8 @@ int main(int argc, char** argv)
     app = gtk_application_new("com.amazinaxel.lightbrowse", G_APPLICATION_HANDLES_OPEN);
     g_signal_connect(app, "activate", G_CALLBACK(on_activate), NULL);
     g_signal_connect(app, "open", G_CALLBACK(on_open), NULL);
+    g_unix_signal_add(SIGTERM, on_term_signal, NULL); /* save tabs on shutdown */
+    g_unix_signal_add(SIGINT, on_term_signal, NULL);
     int status = g_application_run(G_APPLICATION(app), argc, argv);
     g_object_unref(app);
     return status;

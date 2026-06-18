@@ -14,16 +14,10 @@
           fetch = url: builtins.fetchurl url;
 
           filterSources = [
-            # EasyList family
+            # EasyList family (uBlock lists were dropped: compiling a regex per
+            # rule at web-process startup blocked the first page load)
             (fetch "https://easylist.to/easylist/easylist.txt")
             (fetch "https://easylist.to/easylist/easyprivacy.txt")
-            # uBlock Origin's own filter lists
-            (fetch "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt")
-            (fetch "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/badware.txt")
-            (fetch "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/privacy.txt")
-            (fetch "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/quick-fixes.txt")
-            (fetch "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/resource-abuse.txt")
-            (fetch "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/unbreak.txt")
           ];
           # combined lists
           filterList = pkgs.runCommand "lightbrowse-filterlist.txt" { } ''
