@@ -60,6 +60,8 @@ static GtkWidget* statusbar;       /* container: hidden unless loading or hoveri
 static GtkLabel* status_label;     /* hovered or keyboard-focused link */
 static GtkProgressBar* progress;   /* page load progress (hidden when idle) */
 static char* status_link = NULL;   /* hovered or keyboard-focused link URI */
+static char* status_flash = NULL;  /* transient message (e.g. "Download started") */
+static guint status_flash_source = 0;
 static gboolean page_loading = FALSE;
 
 /* Closed-tab ring (full WebKit session state, so the webview is freed) */
@@ -71,6 +73,7 @@ static void notebook_create_new_tab(const char* uri);
 static WebKitWebView* current_view(void);
 static void session_save(void);
 static void update_status(void);
+static void on_download_started(WebKitNetworkSession* session, WebKitDownload* download, gpointer data);
 
 /* ---------------------------------------------------------------- URI load */
 static void load_uri(WebKitWebView* view, const char* uri)
@@ -134,6 +137,7 @@ static WebKitNetworkSession* get_shared_network_session(void)
         webkit_cookie_manager_set_accept_policy(cm, WEBKIT_COOKIE_POLICY_ACCEPT_ALWAYS);
         webkit_website_data_manager_set_favicons_enabled(
             webkit_network_session_get_website_data_manager(session), TRUE);
+        g_signal_connect(session, "download-started", G_CALLBACK(on_download_started), NULL);
     }
     return session;
 }
@@ -155,10 +159,86 @@ static WebKitWebView* current_view(void)
 /* ----------------------------------- status bar (link hover + load progress) */
 static void update_status(void)
 {
-    gtk_label_set_text(status_label, status_link ? status_link : "");
-    gtk_widget_set_visible(GTK_WIDGET(status_label), status_link != NULL);
+    const char* text = status_flash ? status_flash : status_link; /* flash wins over hover */
+    gtk_label_set_text(status_label, text ? text : "");
+    gtk_widget_set_visible(GTK_WIDGET(status_label), text != NULL);
     gtk_widget_set_visible(GTK_WIDGET(progress), page_loading);
-    gtk_widget_set_visible(statusbar, status_link != NULL || page_loading);
+    gtk_widget_set_visible(statusbar, text != NULL || page_loading);
+}
+
+static gboolean status_flash_clear(gpointer data)
+{
+    g_clear_pointer(&status_flash, g_free);
+    status_flash_source = 0;
+    update_status();
+    return G_SOURCE_REMOVE;
+}
+
+/* Show a transient message in the status bar for 2 seconds. */
+static void status_flash_message(const char* msg)
+{
+    g_clear_pointer(&status_flash, g_free);
+    status_flash = g_strdup(msg);
+    if (status_flash_source != 0)
+        g_source_remove(status_flash_source);
+    status_flash_source = g_timeout_add_seconds(2, status_flash_clear, NULL);
+    update_status();
+}
+
+/* ----------------------------------------------------------------- downloads */
+/* Pick the destination path under ~/Downloads, uniquifying on collision so an
+ * existing "file.zip" becomes "file (1).zip" rather than being clobbered. */
+static gboolean on_download_destination(WebKitDownload* download, gchar* suggested_filename, gpointer data)
+{
+    const char* xdg = g_get_user_special_dir(G_USER_DIRECTORY_DOWNLOAD);
+    char* dir = xdg ? g_strdup(xdg) : g_build_filename(g_get_home_dir(), "Downloads", NULL);
+    g_mkdir_with_parents(dir, 0700);
+
+    const char* base = (suggested_filename != NULL && suggested_filename[0] != '\0')
+        ? suggested_filename : "download";
+    char* dest = g_build_filename(dir, base, NULL);
+    const char* ext = strrchr(base, '.'); /* keep the extension when numbering */
+    int stem_len = ext ? (int)(ext - base) : (int)strlen(base);
+    for (int i = 1; g_file_test(dest, G_FILE_TEST_EXISTS); i++) {
+        g_free(dest);
+        char* name = g_strdup_printf("%.*s (%d)%s", stem_len, base, i, ext ? ext : "");
+        dest = g_build_filename(dir, name, NULL);
+        g_free(name);
+    }
+
+    webkit_download_set_destination(download, dest);
+    g_free(dest);
+    g_free(dir);
+    return TRUE;
+}
+
+/* A download opened in a fresh tab (target=_blank / window.open) leaves that tab
+ * blank, since the response converts to a download and never commits a page. Such
+ * a tab has no back/forward history, so close it; tabs with real content stay. */
+static gboolean close_blank_download_tab(gpointer data)
+{
+    WebKitWebView* view = WEBKIT_WEB_VIEW(data);
+    int n = gtk_notebook_page_num(notebook, GTK_WIDGET(view));
+    if (n >= 0 && num_tabs > 1
+        && webkit_back_forward_list_get_current_item(webkit_web_view_get_back_forward_list(view)) == NULL) {
+        GtkWidget* btn = g_object_get_data(G_OBJECT(view), "button");
+        if (btn != NULL)
+            gtk_box_remove(tabbar, btn);
+        gtk_notebook_remove_page(notebook, n);
+        num_tabs -= 1;
+    }
+    g_object_unref(view);
+    return G_SOURCE_REMOVE;
+}
+
+static void on_download_started(WebKitNetworkSession* session, WebKitDownload* download, gpointer data)
+{
+    g_signal_connect(download, "decide-destination", G_CALLBACK(on_download_destination), NULL);
+    status_flash_message("Download started");
+
+    WebKitWebView* view = webkit_download_get_web_view(download);
+    if (view != NULL)
+        g_idle_add(close_blank_download_tab, g_object_ref(view));
 }
 
 /* NULL clears it; ignored for background tabs so they can't hijack the status. */
@@ -305,10 +385,7 @@ static WebKitWebView* append_tab(void)
         NULL);
     NULLCHECK(view);
 
-    webkit_settings_set_user_agent(get_shared_settings(),
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-        "Version/26.0 Safari/605.1.15");
+    webkit_settings_set_user_agent(get_shared_settings(), "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15");
 
     GtkWidget* img = gtk_image_new();
     gtk_image_set_pixel_size(GTK_IMAGE(img), TAB_ICON_SIZE);
@@ -775,6 +852,13 @@ static void handle_shortcut(func id)
         case toggle_tabs:
             tabbar_visible = !tabbar_visible;
             gtk_widget_set_visible(GTK_WIDGET(tabbar), tabbar_visible);
+            break;
+        case print_page:
+            if (view) {
+                WebKitPrintOperation* print = webkit_print_operation_new(view);
+                webkit_print_operation_run_dialog(print, window);
+                g_object_unref(print);
+            }
             break;
         case reading_mode:
             /* Apply the reader transform (refresh the page to undo it). */

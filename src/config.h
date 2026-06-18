@@ -80,6 +80,8 @@ typedef enum {
     edit_uri,
     toggle_tabs,
 
+    print_page,
+
     reading_mode
 } func;
 
@@ -114,4 +116,6 @@ static struct {
 
     { CTRL,        KEY(b),             bookmark_add         },
     { CTRL,        KEY(s),             toggle_tabs          },
+
+    { CTRL,        KEY(P),             print_page           },
 };
