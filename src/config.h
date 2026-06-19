@@ -75,6 +75,7 @@ typedef enum {
     bookmark_add,
     edit_uri,
     toggle_tabs,
+    view_source,
 
     print_page,
 
@@ -111,7 +112,8 @@ static struct {
     { CTRL,        KEY(F),             find_reset           },
 
     { CTRL,        KEY(b),             bookmark_add         },
-    { CTRL,        KEY(s),             toggle_tabs          },
+    { CTRL,        KEY(g),             toggle_tabs          },
+    { CTRL,        KEY(e),             view_source          },
 
     { CTRL,        KEY(P),             print_page           },
 };

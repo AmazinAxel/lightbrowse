@@ -12,7 +12,7 @@
 static const char* CSS =
     ".webarea, .webarea > stack { background: #ffffff; }"
     ".tabbar { background: shade(@theme_bg_color, 1.2); border-right: 0.25rem solid #5e81ac; padding: 4px; }"
-    ".tab { padding: 4px; border: 2px solid #4C566A; border-radius: 4px; outline: none; box-shadow: none; transition: border-color .1s ease; }"
+    ".tab { padding: 4px; border: 0.2rem solid #4C566A; border-radius: 4px; outline: none; box-shadow: none; transition: border-color .1s ease; }"
     ".tab.active { border-color: #5e81ac; }"
     ".dim { background: alpha(black, 0.3); }"
     ".modal { background: @theme_bg_color; color: @theme_fg_color; border: 2px solid #5e81ac; border-radius: 12px; padding: 12px; }"
@@ -587,6 +587,7 @@ static void modal_show(ModalMode mode, gboolean open_new_tab)
     clear_results();
     gtk_entry_set_attributes(modal_entry1, NULL);
     gtk_widget_set_visible(GTK_WIDGET(modal_entry1), TRUE);
+    gtk_widget_set_visible(GTK_WIDGET(modal_results), TRUE);
     gtk_widget_set_visible(GTK_WIDGET(modal_info), FALSE); /* only shown for "Tab limit reached" */
 
     if (mode == MODAL_SEARCH) {
@@ -801,6 +802,28 @@ static void find_hide(void)
     gtk_widget_set_visible(findbar, FALSE);
 }
 
+/* Fetch the page's serialized HTML, then show it as plain text in a new tab. */
+static void on_source_ready(GObject* obj, GAsyncResult* res, gpointer data)
+{
+    WebKitWebView* view = WEBKIT_WEB_VIEW(obj);
+    GError* err = NULL;
+    JSCValue* val = webkit_web_view_evaluate_javascript_finish(view, res, &err);
+    if (val == NULL) {
+        if (err != NULL) g_error_free(err);
+        return;
+    }
+    char* html = jsc_value_to_string(val);
+    const char* base = webkit_web_view_get_uri(view);
+
+    WebKitWebView* src = append_tab();
+    GBytes* bytes = g_bytes_new(html, strlen(html));
+    webkit_web_view_load_bytes(src, bytes, "text/plain", "utf-8", base);
+
+    g_bytes_unref(bytes);
+    g_free(html);
+    g_object_unref(val);
+}
+
 /* ------------------------------------------------------------- shortcuts */
 static void handle_shortcut(func id)
 {
@@ -847,6 +870,7 @@ static void handle_shortcut(func id)
                 gtk_label_set_text(modal_info, "Tab limit reached");
                 gtk_widget_set_visible(GTK_WIDGET(modal_info), TRUE);
                 gtk_widget_set_visible(GTK_WIDGET(modal_entry1), FALSE); /* message only */
+                gtk_widget_set_visible(GTK_WIDGET(modal_results), FALSE); /* drop the empty box's spacing below the label */
                 modal_blocked = TRUE;
             }
             break;
@@ -879,6 +903,12 @@ static void handle_shortcut(func id)
         case toggle_tabs:
             tabbar_visible = !tabbar_visible;
             gtk_widget_set_visible(GTK_WIDGET(tabbar), tabbar_visible);
+            break;
+        case view_source:
+            if (view)
+                webkit_web_view_evaluate_javascript(view,
+                    "document.documentElement.outerHTML", -1, NULL, NULL, NULL,
+                    on_source_ready, NULL);
             break;
         case print_page:
             if (view) {
