@@ -385,10 +385,11 @@ static gboolean on_view_scroll(GtkEventControllerScroll* c, double dx, double dy
         return FALSE; /* let touchpad / smooth scrolling through */
 
     char* js = g_strdup_printf(
-        "(function(dx,dy){var h=document.querySelectorAll(':hover'),e=h[h.length-1];"
+        "(function(dx,dy){var o={left:dx,top:dy,behavior:'smooth'};"
+        "var h=document.querySelectorAll(':hover'),e=h[h.length-1];"
         "while(e){var s=getComputedStyle(e);"
-        "if(e.scrollHeight>e.clientHeight&&/auto|scroll/.test(s.overflowY)){e.scrollBy(dx,dy);return;}"
-        "e=e.parentElement;}window.scrollBy(dx,dy);})(%f,%f);",
+        "if(e.scrollHeight>e.clientHeight&&/auto|scroll/.test(s.overflowY)){e.scrollBy(o);return;}"
+        "e=e.parentElement;}window.scrollBy(o);})(%f,%f);",
         dx * SCROLL_STEP_PX, dy * SCROLL_STEP_PX);
     webkit_web_view_evaluate_javascript(WEBKIT_WEB_VIEW(data), js, -1, NULL, NULL, NULL, NULL, NULL);
     g_free(js);
