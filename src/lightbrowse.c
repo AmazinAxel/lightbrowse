@@ -375,32 +375,51 @@ static void on_switch_page(GtkNotebook* nb, GtkWidget* page, guint n, gpointer d
 static void on_counted_matches(WebKitFindController* fc, guint count, gpointer data);
 static GtkWidget* on_create_tab(WebKitWebView* self, WebKitNavigationAction* action, gpointer data);
 
+/* Last pointer position over the view, in widget (CSS-pixel) coordinates. Tracked
+ * so the synthetic wheel event below carries real clientX/clientY (zoom-to-cursor). */
+static double g_ptr_x = 0, g_ptr_y = 0;
+static void on_view_motion(GtkEventControllerMotion* c, double x, double y, gpointer d)
+{
+    (void)c; (void)d;
+    g_ptr_x = x; g_ptr_y = y;
+}
+
 /* Bigger mouse-wheel steps: WebKit's default wheel scroll barely moves the page.
- * On a wheel notch, scroll the hovered element (or the page) by SCROLL_STEP_PX
- * and consume the native event. Touchpad / smooth scrolling passes through. The
- * `:hover` chain gives the element under the cursor without tracking the pointer.
- * We track an absolute target on the element and scrollTo() it rather than using
- * relative scrollBy(): a smooth scrollBy reads the live mid-animation position, so
- * notches fired in quick succession would clobber each other's remaining distance.
- * Accumulating onto a stored target (reset after W ms idle) makes them stack. */
+ * We consume the native wheel event and handle it ourselves, but consuming it stops
+ * WebKit from dispatching a `wheel` DOM event, which canvas apps (Onshape, maps,
+ * games) need to zoom/orbit. So we re-dispatch a synthetic wheel event to the
+ * element under the cursor: if the page cancels it (preventDefault), it wanted the
+ * wheel for itself and we do nothing more; otherwise we run our amplified scroll.
+ * This must all happen in JS because the GTK handler decides whether to consume
+ * synchronously, before the async JS result (page's preventDefault) is known.
+ *
+ * The amplified scroll tracks an absolute target on the element and scrollTo()s it
+ * rather than using relative scrollBy(): a smooth scrollBy reads the live
+ * mid-animation position, so notches fired in quick succession would clobber each
+ * other's remaining distance. Accumulating onto a stored target (reset after W ms
+ * idle) makes them stack. Touchpad / smooth scrolling passes through untouched. */
 static gboolean on_view_scroll(GtkEventControllerScroll* c, double dx, double dy, gpointer data)
 {
     if (SCROLL_STEP_PX == 0 || gtk_event_controller_scroll_get_unit(c) != GDK_SCROLL_UNIT_WHEEL)
         return FALSE; /* let touchpad / smooth scrolling through */
 
     char* js = g_strdup_printf(
-        "(function(dx,dy){var now=performance.now(),W=700;"
+        "(function(dx,dy,px,py,STEP){"
         "var h=document.querySelectorAll(':hover'),e=h[h.length-1];"
+        "var tgt=e||document.scrollingElement;"
+        "var ev=new WheelEvent('wheel',{deltaX:dx*120,deltaY:dy*120,deltaMode:0,"
+        "clientX:px,clientY:py,bubbles:true,cancelable:true});"
+        "if(!tgt.dispatchEvent(ev))return;" /* page handled the wheel itself */
         "while(e){var s=getComputedStyle(e);"
         "if(e.scrollHeight>e.clientHeight&&/auto|scroll/.test(s.overflowY))break;"
         "e=e.parentElement;}"
-        "var t=e||window,el=e||document.scrollingElement;"
+        "var now=performance.now(),W=700,t=e||window,el=e||document.scrollingElement;"
         "var mY=el.scrollHeight-el.clientHeight,mX=el.scrollWidth-el.clientWidth;"
         "var fresh=t.__lbTs==null||now-t.__lbTs>W;"
         "var bY=fresh?el.scrollTop:t.__lbY,bX=fresh?el.scrollLeft:t.__lbX;"
-        "t.__lbY=Math.max(0,Math.min(mY,bY+dy));t.__lbX=Math.max(0,Math.min(mX,bX+dx));"
-        "t.__lbTs=now;t.scrollTo({left:t.__lbX,top:t.__lbY,behavior:'smooth'});})(%f,%f);",
-        dx * SCROLL_STEP_PX, dy * SCROLL_STEP_PX);
+        "t.__lbY=Math.max(0,Math.min(mY,bY+dy*STEP));t.__lbX=Math.max(0,Math.min(mX,bX+dx*STEP));"
+        "t.__lbTs=now;t.scrollTo({left:t.__lbX,top:t.__lbY,behavior:'smooth'});})(%f,%f,%f,%f,%d);",
+        dx, dy, g_ptr_x, g_ptr_y, SCROLL_STEP_PX);
     webkit_web_view_evaluate_javascript(WEBKIT_WEB_VIEW(data), js, -1, NULL, NULL, NULL, NULL, NULL);
     g_free(js);
     return TRUE; /* consume so WebKit doesn't also scroll */
@@ -462,6 +481,11 @@ static WebKitWebView* append_tab(void)
     gtk_event_controller_set_propagation_phase(scroll, GTK_PHASE_CAPTURE);
     g_signal_connect(scroll, "scroll", G_CALLBACK(on_view_scroll), view);
     gtk_widget_add_controller(GTK_WIDGET(view), scroll);
+
+    GtkEventController* motion = gtk_event_controller_motion_new();
+    gtk_event_controller_set_propagation_phase(motion, GTK_PHASE_CAPTURE);
+    g_signal_connect(motion, "motion", G_CALLBACK(on_view_motion), NULL);
+    gtk_widget_add_controller(GTK_WIDGET(view), motion);
 
     g_signal_connect(view, "create", G_CALLBACK(on_create_tab), NULL);
     g_signal_connect(view, "decide-policy", G_CALLBACK(on_decide_policy), NULL);
