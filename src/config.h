@@ -6,7 +6,6 @@
 #define CLOSED_TAB_HISTORY 3 // how many closed tabs can be reopened (ctrl+shift+t)
 #define FUZZY_RESULTS 3 // max bookmark suggestions shown in the search modal
 #define TAB_ICON_SIZE 24 // px, favicon size in the vertical tab strip
-#define SCROLL_STEP_PX 200 // px scrolled per mouse-wheel notch (0 = WebKit default)
 #define SEARCH "https://bing.com/search?q=%s"
 #define THEME_NAME "Graphite-nord-dark" // GTK UI theme; the UI is always dark
 
