@@ -378,18 +378,28 @@ static GtkWidget* on_create_tab(WebKitWebView* self, WebKitNavigationAction* act
 /* Bigger mouse-wheel steps: WebKit's default wheel scroll barely moves the page.
  * On a wheel notch, scroll the hovered element (or the page) by SCROLL_STEP_PX
  * and consume the native event. Touchpad / smooth scrolling passes through. The
- * `:hover` chain gives the element under the cursor without tracking the pointer. */
+ * `:hover` chain gives the element under the cursor without tracking the pointer.
+ * We track an absolute target on the element and scrollTo() it rather than using
+ * relative scrollBy(): a smooth scrollBy reads the live mid-animation position, so
+ * notches fired in quick succession would clobber each other's remaining distance.
+ * Accumulating onto a stored target (reset after W ms idle) makes them stack. */
 static gboolean on_view_scroll(GtkEventControllerScroll* c, double dx, double dy, gpointer data)
 {
     if (SCROLL_STEP_PX == 0 || gtk_event_controller_scroll_get_unit(c) != GDK_SCROLL_UNIT_WHEEL)
         return FALSE; /* let touchpad / smooth scrolling through */
 
     char* js = g_strdup_printf(
-        "(function(dx,dy){var o={left:dx,top:dy,behavior:'smooth'};"
+        "(function(dx,dy){var now=performance.now(),W=700;"
         "var h=document.querySelectorAll(':hover'),e=h[h.length-1];"
         "while(e){var s=getComputedStyle(e);"
-        "if(e.scrollHeight>e.clientHeight&&/auto|scroll/.test(s.overflowY)){e.scrollBy(o);return;}"
-        "e=e.parentElement;}window.scrollBy(o);})(%f,%f);",
+        "if(e.scrollHeight>e.clientHeight&&/auto|scroll/.test(s.overflowY))break;"
+        "e=e.parentElement;}"
+        "var t=e||window,el=e||document.scrollingElement;"
+        "var mY=el.scrollHeight-el.clientHeight,mX=el.scrollWidth-el.clientWidth;"
+        "var fresh=t.__lbTs==null||now-t.__lbTs>W;"
+        "var bY=fresh?el.scrollTop:t.__lbY,bX=fresh?el.scrollLeft:t.__lbX;"
+        "t.__lbY=Math.max(0,Math.min(mY,bY+dy));t.__lbX=Math.max(0,Math.min(mX,bX+dx));"
+        "t.__lbTs=now;t.scrollTo({left:t.__lbX,top:t.__lbY,behavior:'smooth'});})(%f,%f);",
         dx * SCROLL_STEP_PX, dy * SCROLL_STEP_PX);
     webkit_web_view_evaluate_javascript(WEBKIT_WEB_VIEW(data), js, -1, NULL, NULL, NULL, NULL, NULL);
     g_free(js);
