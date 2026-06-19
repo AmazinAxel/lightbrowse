@@ -96,7 +96,7 @@ static struct {
     { CTRL,        KEY(R),             refresh_force        },
 
     { CTRL,        KEY(p),             reading_mode         },
-    { CTRL,        KEY(z),             edit_uri             },
+    { CTRL,        KEY(m),             edit_uri             },
 
     { CTRL,        KEY(equal),         zoomin               },
     { CTRL,        KEY(minus),         zoomout              },

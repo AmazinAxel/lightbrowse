@@ -10,6 +10,7 @@
 #include "plugins/plugins.h"
 
 static const char* CSS =
+    ".webarea, .webarea > stack { background: #ffffff; }"
     ".tabbar { background: shade(@theme_bg_color, 1.2); border-right: 0.25rem solid #5e81ac; padding: 4px; }"
     ".tab { padding: 4px; border: 2px solid #4C566A; border-radius: 4px; outline: none; box-shadow: none; transition: border-color .1s ease; }"
     ".tab.active { border-color: #5e81ac; }"
@@ -1095,6 +1096,7 @@ static void ensure_window(void)
     notebook = GTK_NOTEBOOK(gtk_notebook_new());
     gtk_notebook_set_show_tabs(notebook, FALSE);
     gtk_notebook_set_show_border(notebook, FALSE);
+    gtk_widget_add_css_class(GTK_WIDGET(notebook), "webarea");
     gtk_widget_set_hexpand(GTK_WIDGET(notebook), TRUE);
     g_signal_connect(notebook, "switch-page", G_CALLBACK(on_switch_page), NULL);
 
