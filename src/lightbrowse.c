@@ -713,6 +713,15 @@ static void on_search_changed(GtkEditable* editable, gpointer data)
     }
 }
 
+static void modal_open_search_uri(const char* uri)
+{
+    if (modal_new_tab || current_view() == NULL) /* no warm tab yet -> make one */
+        notebook_create_new_tab(uri);
+    else
+        load_uri(current_view(), uri);
+    modal_hide();
+}
+
 static void on_modal_activate(GtkEntry* entry, gpointer data)
 {
     if (modal_blocked) {
@@ -725,16 +734,14 @@ static void on_modal_activate(GtkEntry* entry, gpointer data)
             uri = fuzzy_urls[fuzzy_sel];
         else
             uri = gtk_editable_get_text(GTK_EDITABLE(modal_entry1));
-        if (modal_new_tab || current_view() == NULL) /* no warm tab yet -> make one */
-            notebook_create_new_tab(uri);
-        else
-            load_uri(current_view(), uri);
-    } else { /* MODAL_BOOKMARK */
-        const char* name = gtk_editable_get_text(GTK_EDITABLE(modal_entry1));
-        const char* url = gtk_editable_get_text(GTK_EDITABLE(modal_entry2));
-        if (name[0] != '\0' && url[0] != '\0')
-            bookmarks_save(BOOKMARKS_DIR, name, url);
+        modal_open_search_uri(uri);
+        return;
     }
+    /* MODAL_BOOKMARK */
+    const char* name = gtk_editable_get_text(GTK_EDITABLE(modal_entry1));
+    const char* url = gtk_editable_get_text(GTK_EDITABLE(modal_entry2));
+    if (name[0] != '\0' && url[0] != '\0')
+        bookmarks_save(BOOKMARKS_DIR, name, url);
     modal_hide();
 }
 
@@ -942,6 +949,13 @@ static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval
 
     if (modal_mode != MODAL_NONE) {
         if (modal_mode == MODAL_SEARCH) {
+            /* Shift+Enter jumps straight to the top fuzzy bookmark match,
+             * skipping the typed-text search. No-op when nothing matched. */
+            if ((state & SFT) && (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter)) {
+                if (fuzzy_count > 0)
+                    modal_open_search_uri(fuzzy_urls[0]);
+                return TRUE;
+            }
             if (keyval == GDK_KEY_Down) {
                 modal_move_sel(1);
                 return TRUE;
