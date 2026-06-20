@@ -154,9 +154,12 @@ static WebKitNetworkSession* get_shared_network_session(void)
          * and repeat-visit speed are unaffected. */
         WebKitMemoryPressureSettings* mp = webkit_memory_pressure_settings_new();
         webkit_memory_pressure_settings_set_memory_limit(mp, 2048);          /* MB per process */
-        webkit_memory_pressure_settings_set_conservative_threshold(mp, 0.5); /* >1.0GB: start releasing caches */
-        webkit_memory_pressure_settings_set_strict_threshold(mp, 0.65);      /* >1.3GB: release aggressively */
+        /* Set thresholds top-down (kill > strict > conservative): each setter asserts
+         * its value sits below the *current* next-higher threshold, and the defaults
+         * (conservative 0.33, strict 0.5) would reject conservative=0.5 if set first. */
         webkit_memory_pressure_settings_set_kill_threshold(mp, 0.95);        /* ~1.95GB: kill a runaway process */
+        webkit_memory_pressure_settings_set_strict_threshold(mp, 0.65);      /* >1.3GB: release aggressively */
+        webkit_memory_pressure_settings_set_conservative_threshold(mp, 0.5); /* >1.0GB: start releasing caches */
         webkit_network_session_set_memory_pressure_settings(mp);
         webkit_memory_pressure_settings_free(mp);
 
@@ -404,6 +407,11 @@ static void on_web_process_terminated(WebKitWebView* view,
     g_object_set_data_full(G_OBJECT(view), "reload-uri", g_strdup(uri ? uri : ""), g_free);
     g_object_set_data(G_OBJECT(view), "dead", GINT_TO_POINTER(1));
     tab_set_asleep(view, TRUE);
+    /* Sleeping must never leave the tab you're looking at blank/dimmed: if WebKit's
+     * memory-pressure killer (or a crash) takes the foreground process, reload it
+     * right away instead of waiting for the user to navigate back. */
+    if (view == current_view())
+        revive_if_dead(view);
 }
 
 /* A tab is worth sleeping only if it actually holds a live page we can reload:
@@ -577,13 +585,24 @@ static void apply_view_background(WebKitWebView* view)
     webkit_web_view_set_background_color(view, &c);
 }
 
-static WebKitWebView* append_tab(void)
+/* When `related` is non-NULL the new view is a popup (window.open / target=_blank):
+ * constructing it with "related-view" keeps it in the opener's web process and
+ * session and, crucially, preserves window.opener. Microsoft Rewards card
+ * activities (and many OAuth popups) report completion back through that opener
+ * channel, so a detached popup silently fails to credit. A NULL related view is a
+ * normal top-level tab using the shared session/context. */
+static WebKitWebView* append_tab(WebKitWebView* related)
 {
-    WebKitWebView* view = g_object_new(WEBKIT_TYPE_WEB_VIEW,
-        "settings", get_shared_settings(),
-        "network-session", get_shared_network_session(),
-        "web-context", get_shared_web_context(),
-        NULL);
+    WebKitWebView* view = related
+        ? g_object_new(WEBKIT_TYPE_WEB_VIEW,
+            "related-view", related, /* shares process + session, keeps window.opener */
+            "settings", get_shared_settings(),
+            NULL)
+        : g_object_new(WEBKIT_TYPE_WEB_VIEW,
+            "settings", get_shared_settings(),
+            "network-session", get_shared_network_session(),
+            "web-context", get_shared_web_context(),
+            NULL);
     NULLCHECK(view);
     apply_view_background(view);
 
@@ -633,16 +652,17 @@ static WebKitWebView* append_tab(void)
  * by a page (window.open / target=_blank) or from another app are never blocked. */
 static void notebook_create_new_tab(const char* uri)
 {
-    WebKitWebView* view = append_tab();
+    WebKitWebView* view = append_tab(NULL);
     load_uri(view, uri ? uri : "about:blank"); /* about:blank spins up the web process */
 }
 
-static GtkWidget* on_create_tab(WebKitWebView* self, WebKitNavigationAction* action, gpointer data)
+static GtkWidget* on_create_tab(WebKitWebView* self,
+    WebKitNavigationAction* action G_GNUC_UNUSED, gpointer data G_GNUC_UNUSED)
 {
-    WebKitURIRequest* req = webkit_navigation_action_get_request(action);
-    webkit_web_view_stop_loading(self);
-    notebook_create_new_tab(webkit_uri_request_get_uri(req));
-    return ABORT_REQUEST_ON_CURRENT_TAB;
+    /* Return a real related view so WebKit drives the popup itself, preserving
+     * window.opener. The old code stopped the opener and reloaded the URL in a
+     * detached tab, which broke Rewards/OAuth completion (see append_tab). */
+    return GTK_WIDGET(append_tab(self));
 }
 
 /* A page about to be removed must not linger as an alt+tab target. */
@@ -688,7 +708,7 @@ static void reopen_closed_tab(void)
     if (closed_count == 0)
         return;
     WebKitWebViewSessionState* st = closed_tabs[--closed_count];
-    WebKitWebView* view = append_tab();
+    WebKitWebView* view = append_tab(NULL);
     webkit_web_view_restore_session_state(view, st);
     WebKitBackForwardList* bf = webkit_web_view_get_back_forward_list(view);
     WebKitBackForwardListItem* item = webkit_back_forward_list_get_current_item(bf);
@@ -1004,7 +1024,7 @@ static void on_source_ready(GObject* obj, GAsyncResult* res, gpointer data)
     char* html = jsc_value_to_string(val);
     const char* base = webkit_web_view_get_uri(view);
 
-    WebKitWebView* src = append_tab();
+    WebKitWebView* src = append_tab(NULL);
     GBytes* bytes = g_bytes_new(html, strlen(html));
     webkit_web_view_load_bytes(src, bytes, "text/plain", "utf-8", base);
 

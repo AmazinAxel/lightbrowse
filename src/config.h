@@ -47,7 +47,6 @@
 #define ALT  1 << 3
 
 /* Misc helpers */
-#define ABORT_REQUEST_ON_CURRENT_TAB NULL
 #define NULLCHECK(x)                                   \
     do {                                               \
         if (x == NULL) {                               \
