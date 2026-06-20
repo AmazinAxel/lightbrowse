@@ -14,6 +14,7 @@ static const char* CSS =
     ".tabbar { background: shade(@theme_bg_color, 1.2); border-right: 0.25rem solid #5e81ac; padding: 4px; }"
     ".tab { padding: 4px; border: 0.2rem solid #4C566A; border-radius: 4px; outline: none; box-shadow: none; transition: border-color .1s ease; }"
     ".tab.active { border-color: #5e81ac; }"
+    ".tab.asleep { opacity: 0.5; }" /* slept tab: web process freed, reopen to reload */
     ".dim { background: alpha(black, 0.3); }"
     ".modal { background: @theme_bg_color; color: @theme_fg_color; border: 2px solid #5e81ac; border-radius: 12px; padding: 12px; }"
     ".modal entry { min-width: 280px; }"
@@ -35,6 +36,10 @@ static GtkNotebook* notebook;
 static GtkBox* tabbar; /* vertical favicon strip */
 static gboolean tabbar_visible = TRUE;
 static int num_tabs = 0;
+
+/* Most-recently-used tab tracking (alt+tab jumps to the previously-viewed tab). */
+static GtkWidget* mru_current = NULL; /* the page we currently consider active */
+static GtkWidget* mru_prev = NULL;    /* the page active before it (alt+tab target) */
 
 /* Modal (search / bookmark) */
 typedef enum { MODAL_NONE, MODAL_SEARCH, MODAL_BOOKMARK } ModalMode;
@@ -82,6 +87,8 @@ static WebKitWebView* current_view(void);
 static void session_save(void);
 static void update_status(void);
 static void on_download_started(WebKitNetworkSession* session, WebKitDownload* download, gpointer data);
+static void forget_mru(GtkWidget* page);
+static void tab_set_asleep(WebKitWebView* view, gboolean asleep);
 
 /* ---------------------------------------------------------------- URI load */
 static void load_uri(WebKitWebView* view, const char* uri)
@@ -328,6 +335,7 @@ static void on_load_changed(WebKitWebView* view, WebKitLoadEvent event, gpointer
     if (event == WEBKIT_LOAD_STARTED) {
         page_loading = TRUE;
         g_object_set_data(G_OBJECT(view), "dead", NULL); /* a load means it's alive again */
+        tab_set_asleep(view, FALSE);                     /* and no longer dimmed */
         gtk_progress_bar_set_fraction(progress, 0.0);
     } else if (event == WEBKIT_LOAD_FINISHED) {
         page_loading = FALSE;
@@ -354,11 +362,31 @@ static void on_link_focus_message(WebKitUserContentManager* ucm, JSCValue* value
  * alive but blank, so the tab stays in the bar. We remember its URL and mark it
  * "dead"; the page is reloaded lazily only when the user navigates back to that
  * tab — so a runaway background page can't immediately OOM again. */
+/* Dim a tab's button to 50% (kept favicon and all) while it's slept/dead. */
+static void tab_set_asleep(WebKitWebView* view, gboolean asleep)
+{
+    GtkWidget* btn = g_object_get_data(G_OBJECT(view), "button");
+    if (btn == NULL)
+        return;
+    if (asleep)
+        gtk_widget_add_css_class(btn, "asleep");
+    else
+        gtk_widget_remove_css_class(btn, "asleep");
+}
+
+/* Record when a tab was last the active one, so the sweep sleeps the least-recently-used one first. */
+static void tab_touch(WebKitWebView* view)
+{
+    g_object_set_data(G_OBJECT(view), "last-active",
+        GSIZE_TO_POINTER((gsize)(g_get_monotonic_time() / G_USEC_PER_SEC)));
+}
+
 static void revive_if_dead(WebKitWebView* view)
 {
     if (view == NULL || g_object_get_data(G_OBJECT(view), "dead") == NULL)
         return;
     g_object_set_data(G_OBJECT(view), "dead", NULL);
+    tab_set_asleep(view, FALSE);
     const char* uri = g_object_get_data(G_OBJECT(view), "reload-uri");
     if (uri != NULL && uri[0] != '\0')
         webkit_web_view_load_uri(view, uri);
@@ -366,14 +394,89 @@ static void revive_if_dead(WebKitWebView* view)
         webkit_web_view_reload(view);
 }
 
+/* Both a memory-kill and a proactive sleep land here: keep the tab but free its
+ * web process, remember the URL, mark it dead, and dim it. revive_if_dead (driven
+ * by on_tab_pressed / on_switch_page) reloads it only when the user goes back. */
 static void on_web_process_terminated(WebKitWebView* view,
     WebKitWebProcessTerminationReason reason, gpointer data)
 {
-    /* Keep the tab; just remember where it was so re-selecting it reloads that
-     * page (revive_if_dead, driven by on_tab_pressed / on_switch_page). */
     const char* uri = webkit_web_view_get_uri(view);
     g_object_set_data_full(G_OBJECT(view), "reload-uri", g_strdup(uri ? uri : ""), g_free);
     g_object_set_data(G_OBJECT(view), "dead", GINT_TO_POINTER(1));
+    tab_set_asleep(view, TRUE);
+}
+
+/* A tab is worth sleeping only if it actually holds a live page we can reload:
+ * not already slept/crashed, not playing audio (don't cut off music/video), and
+ * showing a real URL (a blank/about tab has nothing to free). */
+static gboolean tab_sleepable(WebKitWebView* view)
+{
+    if (g_object_get_data(G_OBJECT(view), "dead") != NULL)
+        return FALSE;
+    if (webkit_web_view_is_playing_audio(view))
+        return FALSE;
+    const char* uri = webkit_web_view_get_uri(view);
+    return uri != NULL && uri[0] != '\0' && !g_str_has_prefix(uri, "about:");
+}
+
+/* Sleep a background tab: terminating its web process hands the RAM back to the OS
+ * (the bulk of a heavy page's cost). The web-process-terminated handler above
+ * remembers the URL and dims the tab; it reloads when the user reselects it. */
+static void sleep_tab(WebKitWebView* view)
+{
+    if (tab_sleepable(view))
+        webkit_web_view_terminate_web_process(view);
+}
+
+/* Available system memory in MiB, or -1 if /proc/meminfo can't be read. */
+static long system_available_mb(void)
+{
+    char* contents = NULL;
+    if (!g_file_get_contents("/proc/meminfo", &contents, NULL, NULL))
+        return -1;
+    long mb = -1;
+    char* p = strstr(contents, "MemAvailable:");
+    if (p != NULL)
+        mb = strtol(p + strlen("MemAvailable:"), NULL, 10) / 1024; /* the field is in kB */
+    g_free(contents);
+    return mb;
+}
+
+/* The crash defense: every few seconds, check how much system RAM is free. While
+ * there's plenty, leave every tab loaded. Under pressure, sleep the
+ * least-recently-used background tab (one per sweep — it's self-correcting as the
+ * OS reclaims memory). If memory is critically low, sleep every background tab at
+ * once so the machine can't OOM out from under us. */
+static gboolean sleep_sweep(gpointer data)
+{
+    if (notebook == NULL)
+        return G_SOURCE_CONTINUE;
+    long avail = system_available_mb();
+    if (avail < 0 || avail >= TAB_SLEEP_LOW_MEM_MB)
+        return G_SOURCE_CONTINUE; /* can't tell, or plenty free: don't touch any tab */
+    gboolean critical = avail < TAB_SLEEP_CRITICAL_MEM_MB;
+
+    GtkWidget* cur = gtk_notebook_get_nth_page(notebook, gtk_notebook_get_current_page(notebook));
+    GtkWidget* lru = NULL;
+    gint64 lru_time = G_MAXINT64;
+    int n = gtk_notebook_get_n_pages(notebook);
+    for (int i = 0; i < n; i++) {
+        GtkWidget* page = gtk_notebook_get_nth_page(notebook, i);
+        if (page == cur || !tab_sleepable(WEBKIT_WEB_VIEW(page)))
+            continue; /* never sleep the tab you're looking at */
+        if (critical) {
+            sleep_tab(WEBKIT_WEB_VIEW(page)); /* OOM imminent: dump them all */
+            continue;
+        }
+        gint64 last = (gint64)GPOINTER_TO_SIZE(g_object_get_data(G_OBJECT(page), "last-active"));
+        if (last < lru_time) {
+            lru_time = last;
+            lru = page;
+        }
+    }
+    if (!critical && lru != NULL)
+        sleep_tab(WEBKIT_WEB_VIEW(lru));
+    return G_SOURCE_CONTINUE;
 }
 
 /* Switch on press (capture phase) rather than on the button's release-driven
@@ -410,8 +513,15 @@ static void on_switch_page(GtkNotebook* nb, GtkWidget* page, guint n, gpointer d
     if (btn != NULL)
         gtk_widget_add_css_class(btn, "active");
 
+    /* Track most-recently-used order so alt+tab can jump to the previous tab. */
+    if (page != mru_current) {
+        mru_prev = mru_current;
+        mru_current = page;
+    }
+
     /* Resync the status bar to the now-current tab. */
     WebKitWebView* view = WEBKIT_WEB_VIEW(page);
+    tab_touch(view); /* mark active now so the sleep sweep leaves it alone */
     g_clear_pointer(&status_link, g_free); /* no hover/focus on the new tab yet */
     page_loading = webkit_web_view_is_loading(view);
     if (page_loading)
@@ -514,6 +624,7 @@ static WebKitWebView* append_tab(void)
 
     int n = gtk_notebook_append_page(notebook, GTK_WIDGET(view), NULL);
     gtk_notebook_set_current_page(notebook, n);
+    tab_touch(view); /* seed last-active so the sleep sweep doesn't fire immediately */
     num_tabs += 1;
     return view;
 }
@@ -534,6 +645,15 @@ static GtkWidget* on_create_tab(WebKitWebView* self, WebKitNavigationAction* act
     return ABORT_REQUEST_ON_CURRENT_TAB;
 }
 
+/* A page about to be removed must not linger as an alt+tab target. */
+static void forget_mru(GtkWidget* page)
+{
+    if (mru_current == page)
+        mru_current = NULL;
+    if (mru_prev == page)
+        mru_prev = NULL;
+}
+
 static void push_closed(WebKitWebViewSessionState* st)
 {
     if (closed_count == CLOSED_TAB_HISTORY) {
@@ -551,6 +671,7 @@ static void close_current_tab(void)
         return;
     push_closed(webkit_web_view_get_session_state(view));
 
+    forget_mru(GTK_WIDGET(view));
     GtkWidget* btn = g_object_get_data(G_OBJECT(view), "button");
     if (btn != NULL)
         gtk_box_remove(tabbar, btn);
@@ -920,16 +1041,28 @@ static void handle_shortcut(func id)
         case zoom_reset:
             if (view) webkit_web_view_set_zoom_level(view, (zoom = 1.0));
             break;
-        case next_tab: {
-            int n = gtk_notebook_get_n_pages(notebook);
+        case tab_up: { /* up the list; do nothing if already at the top */
             int k = gtk_notebook_get_current_page(notebook);
-            gtk_notebook_set_current_page(notebook, (k + 1) % n);
+            if (k > 0)
+                gtk_notebook_set_current_page(notebook, k - 1);
             break;
         }
-        case prev_tab: {
+        case tab_down: { /* down the list; do nothing if already at the bottom */
             int n = gtk_notebook_get_n_pages(notebook);
             int k = gtk_notebook_get_current_page(notebook);
-            gtk_notebook_set_current_page(notebook, (n + k - 1) % n);
+            if (k < n - 1)
+                gtk_notebook_set_current_page(notebook, k + 1);
+            break;
+        }
+        case last_tab: { /* alt+tab: jump back to the previously-viewed tab */
+            GtkWidget* target = mru_prev; /* on_switch_page reassigns mru_prev, so grab it first */
+            if (target != NULL) {
+                int k = gtk_notebook_page_num(notebook, target);
+                if (k >= 0) {
+                    gtk_notebook_set_current_page(notebook, k);
+                    revive_if_dead(WEBKIT_WEB_VIEW(target)); /* wake it if it was slept */
+                }
+            }
             break;
         }
         case new_tab:
@@ -1244,6 +1377,8 @@ static void ensure_window(void)
     gtk_widget_add_controller(GTK_WIDGET(window), keys);
 
     setup_theme();
+    /* Sleep idle tabs only when system RAM runs low (see sleep_sweep). */
+    g_timeout_add_seconds(TAB_SLEEP_SWEEP_SECONDS, sleep_sweep, NULL);
     /* No tab is created here: the caller paints the window/modal first, then warms
      * the web process on idle, so the search box appears without waiting on WebKit. */
 }

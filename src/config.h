@@ -4,6 +4,12 @@
 #define ZOOM_STEPSIZE .1
 #define MAX_NUM_TABS 16 // 0 for inf tabs
 #define CLOSED_TAB_HISTORY 3 // how many closed tabs can be reopened (ctrl+shift+t)
+/* Tab sleeping is driven by *system* memory pressure, not a fixed timer: tabs only
+ * sleep when the machine is actually low on RAM. A slept tab's web process is freed
+ * (RAM reclaimed), its button dims to 50%, and reselecting it reloads the page. */
+#define TAB_SLEEP_LOW_MEM_MB 1536     // below this much available system RAM, sleep the least-recently-used background tab
+#define TAB_SLEEP_CRITICAL_MEM_MB 768 // below this, sleep every background tab at once to head off an imminent system OOM
+#define TAB_SLEEP_SWEEP_SECONDS 8     // how often to check available memory
 #define FUZZY_RESULTS 3 // max bookmark suggestions shown in the search modal
 #define TAB_ICON_SIZE 24 // px, favicon size in the vertical tab strip
 #define SEARCH "https://bing.com/search?q=%s"
@@ -64,8 +70,9 @@ typedef enum {
     zoom_reset,
 
     new_tab,
-    next_tab,
-    prev_tab,
+    tab_up,
+    tab_down,
+    last_tab,
     close_tab,
     reopen_tab,
 
@@ -102,8 +109,9 @@ static struct {
     { CTRL,        KEY(minus),         zoomout              },
     { CTRL,        KEY(0),             zoom_reset           },
 
-    { CTRL,        KEY(Tab),           next_tab             },
-    { ALT,         KEY(Tab),           prev_tab             },
+    { ALT,         KEY(Tab),           last_tab             },
+    { ALT,         KEY(Up),            tab_up               },
+    { ALT,         KEY(Down),          tab_down             },
     { CTRL,        KEY(t),             new_tab              },
     { CTRL,        KEY(w),             close_tab            },
     { CTRL,        KEY(T),             reopen_tab           },

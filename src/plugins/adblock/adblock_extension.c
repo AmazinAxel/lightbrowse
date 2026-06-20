@@ -8,6 +8,7 @@
  */
 
 #include <webkit/webkit-web-process-extension.h>
+#include <string.h>
 #include "uri_tester.h"
 
 /* Configuration - must match ADBLOCK_FILTERLIST_PATH in config.h.
@@ -18,6 +19,41 @@
 
 static AdblockUriTester* tester = NULL;
 static gboolean adblock_enabled = TRUE;
+
+/* Microsoft Rewards credits searches via attribution/tracking requests (e.g. to
+ * bat.bing.com) that EasyPrivacy would otherwise block, so points never register
+ * unless you click links from the Rewards sidebar. Whitelist the Rewards + Bing
+ * attribution hosts: any request TO one of these, or any request made while one of
+ * these is the page, bypasses the filter entirely. Add hosts here as needed. */
+static const char* const WHITELIST_DOMAINS[] = {
+    "rewards.bing.com",
+    "rewards.microsoft.com",
+    "bat.bing.com",
+    "c.bing.com",
+};
+
+/* TRUE if uri's host equals, or is a subdomain of, a whitelisted domain. */
+static gboolean
+uri_host_whitelisted(const char* uri)
+{
+    if (!uri)
+        return FALSE;
+    const char* host = strstr(uri, "://");
+    if (!host)
+        return FALSE;
+    host += 3;
+    gsize host_len = strcspn(host, "/?#"); /* host ends at the path/query/fragment */
+    for (gsize i = 0; i < G_N_ELEMENTS(WHITELIST_DOMAINS); i++) {
+        gsize dlen = strlen(WHITELIST_DOMAINS[i]);
+        if (host_len < dlen)
+            continue;
+        const char* tail = host + (host_len - dlen); /* match against the end of the host */
+        if (strncmp(tail, WHITELIST_DOMAINS[i], dlen) == 0
+            && (host_len == dlen || tail[-1] == '.')) /* exact host or a .subdomain boundary */
+            return TRUE;
+    }
+    return FALSE;
+}
 
 /*
  * Called for each resource request (images, scripts, stylesheets, etc.)
@@ -42,6 +78,10 @@ on_send_request(WebKitWebPage* page,
     /* Skip non-HTTP(S) requests */
     if (!g_str_has_prefix(request_uri, "http://") &&
         !g_str_has_prefix(request_uri, "https://"))
+        return FALSE;
+
+    /* Never filter Microsoft Rewards / Bing attribution requests (see above). */
+    if (uri_host_whitelisted(request_uri) || uri_host_whitelisted(page_uri))
         return FALSE;
 
     /* Check if this URI should be blocked */
