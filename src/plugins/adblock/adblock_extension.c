@@ -20,16 +20,20 @@
 static AdblockUriTester* tester = NULL;
 static gboolean adblock_enabled = TRUE;
 
-/* Microsoft Rewards credits searches via attribution/tracking requests (e.g. to
- * bat.bing.com) that EasyPrivacy would otherwise block, so points never register
- * unless you click links from the Rewards sidebar. Whitelist the Rewards + Bing
- * attribution hosts: any request TO one of these, or any request made while one of
- * these is the page, bypasses the filter entirely. Add hosts here as needed. */
+/* Microsoft Rewards credits searches and card activities via attribution/tracking
+ * requests that EasyPrivacy would otherwise block, so points never register. Card
+ * activities (quizzes, polls, daily sets) actually run on www.bing.com and fire
+ * their crediting beacons from there, so whitelisting only the rewards.* and
+ * bat/c.bing.com hosts left most cards silently failing. Whitelist all of bing.com
+ * (the search engine anyway) plus the Microsoft account + auth hosts: any request
+ * TO one of these, or any request made while one of these is the page, bypasses the
+ * filter entirely. Note: this disables ad/tracker blocking on Bing pages. Match is
+ * by host suffix, so bing.com covers www/c/bat/th/rewards.bing.com. Add hosts as needed. */
 static const char* const WHITELIST_DOMAINS[] = {
-    "rewards.bing.com",
+    "bing.com",
     "rewards.microsoft.com",
-    "bat.bing.com",
-    "c.bing.com",
+    "account.microsoft.com",
+    "login.live.com",
 };
 
 /* TRUE if uri's host equals, or is a subdomain of, a whitelisted domain. */

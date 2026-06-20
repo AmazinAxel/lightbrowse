@@ -7,8 +7,8 @@
 /* Tab sleeping is driven by *system* memory pressure, not a fixed timer: tabs only
  * sleep when the machine is actually low on RAM. A slept tab's web process is freed
  * (RAM reclaimed), its button dims to 50%, and reselecting it reloads the page. */
-#define TAB_SLEEP_LOW_MEM_MB 1536     // below this much available system RAM, sleep the least-recently-used background tab
-#define TAB_SLEEP_CRITICAL_MEM_MB 768 // below this, sleep every background tab at once to head off an imminent system OOM
+#define TAB_SLEEP_LOW_MEM_MB 640      // below this much available system RAM, sleep the least-recently-used background tab
+#define TAB_SLEEP_CRITICAL_MEM_MB 320 // below this, sleep every background tab at once to head off an imminent system OOM
 #define TAB_SLEEP_SWEEP_SECONDS 8     // how often to check available memory
 #define FUZZY_RESULTS 3 // max bookmark suggestions shown in the search modal
 #define TAB_ICON_SIZE 24 // px, favicon size in the vertical tab strip
