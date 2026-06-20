@@ -73,6 +73,9 @@ static gboolean page_loading = FALSE;
 static WebKitWebViewSessionState* closed_tabs[CLOSED_TAB_HISTORY];
 static int closed_count = 0;
 
+/* System color scheme watcher (the chrome stays dark; only websites follow it). */
+static GSettings* iface_settings = NULL;
+
 /* Forward declarations */
 static void notebook_create_new_tab(const char* uri);
 static WebKitWebView* current_view(void);
@@ -134,6 +137,22 @@ static WebKitNetworkSession* get_shared_network_session(void)
 {
     static WebKitNetworkSession* session = NULL;
     if (session == NULL) {
+        /* Bound WebKit's memory before the first network/web process spawns (the
+         * setter is global and must run before any session). WebKit reclaims a
+         * tab's process on close fine; this caps the *inherent* per-process cost
+         * so a few heavy pages can't exhaust a small-RAM machine. As a process
+         * climbs toward the per-process limit, caches are released early; a single
+         * runaway page is killed (sad-tab) before the whole system OOMs. Typical
+         * tabs (100-400MB) stay well under these thresholds, so normal browsing
+         * and repeat-visit speed are unaffected. */
+        WebKitMemoryPressureSettings* mp = webkit_memory_pressure_settings_new();
+        webkit_memory_pressure_settings_set_memory_limit(mp, 2048);          /* MB per process */
+        webkit_memory_pressure_settings_set_conservative_threshold(mp, 0.5); /* >1.0GB: start releasing caches */
+        webkit_memory_pressure_settings_set_strict_threshold(mp, 0.65);      /* >1.3GB: release aggressively */
+        webkit_memory_pressure_settings_set_kill_threshold(mp, 0.95);        /* ~1.95GB: kill a runaway process */
+        webkit_network_session_set_memory_pressure_settings(mp);
+        webkit_memory_pressure_settings_free(mp);
+
         session = webkit_network_session_new(DATA_DIR, DATA_DIR);
         WebKitCookieManager* cm = webkit_network_session_get_cookie_manager(session);
         webkit_cookie_manager_set_persistent_storage(cm, DATA_DIR "/cookies.sqlite", WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
@@ -308,6 +327,7 @@ static void on_load_changed(WebKitWebView* view, WebKitLoadEvent event, gpointer
         return;
     if (event == WEBKIT_LOAD_STARTED) {
         page_loading = TRUE;
+        g_object_set_data(G_OBJECT(view), "dead", NULL); /* a load means it's alive again */
         gtk_progress_bar_set_fraction(progress, 0.0);
     } else if (event == WEBKIT_LOAD_FINISHED) {
         page_loading = FALSE;
@@ -330,6 +350,32 @@ static void on_link_focus_message(WebKitUserContentManager* ucm, JSCValue* value
 }
 
 /* ----------------------------------------------------------------- tabs */
+/* When a web process is killed (e.g. the memory kill-threshold) the view stays
+ * alive but blank, so the tab stays in the bar. We remember its URL and mark it
+ * "dead"; the page is reloaded lazily only when the user navigates back to that
+ * tab — so a runaway background page can't immediately OOM again. */
+static void revive_if_dead(WebKitWebView* view)
+{
+    if (view == NULL || g_object_get_data(G_OBJECT(view), "dead") == NULL)
+        return;
+    g_object_set_data(G_OBJECT(view), "dead", NULL);
+    const char* uri = g_object_get_data(G_OBJECT(view), "reload-uri");
+    if (uri != NULL && uri[0] != '\0')
+        webkit_web_view_load_uri(view, uri);
+    else
+        webkit_web_view_reload(view);
+}
+
+static void on_web_process_terminated(WebKitWebView* view,
+    WebKitWebProcessTerminationReason reason, gpointer data)
+{
+    /* Keep the tab; just remember where it was so re-selecting it reloads that
+     * page (revive_if_dead, driven by on_tab_pressed / on_switch_page). */
+    const char* uri = webkit_web_view_get_uri(view);
+    g_object_set_data_full(G_OBJECT(view), "reload-uri", g_strdup(uri ? uri : ""), g_free);
+    g_object_set_data(G_OBJECT(view), "dead", GINT_TO_POINTER(1));
+}
+
 /* Switch on press (capture phase) rather than on the button's release-driven
  * "clicked", so mouse selection feels as instant as the keyboard. */
 static void on_tab_pressed(GtkGestureClick* gesture, int n_press, double x, double y, WebKitWebView* view)
@@ -337,6 +383,7 @@ static void on_tab_pressed(GtkGestureClick* gesture, int n_press, double x, doub
     int n = gtk_notebook_page_num(notebook, GTK_WIDGET(view));
     if (n >= 0)
         gtk_notebook_set_current_page(notebook, n);
+    revive_if_dead(view); /* clicking a killed tab reloads it (same page if current) */
     gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
 }
 
@@ -370,6 +417,7 @@ static void on_switch_page(GtkNotebook* nb, GtkWidget* page, guint n, gpointer d
     if (page_loading)
         gtk_progress_bar_set_fraction(progress, webkit_web_view_get_estimated_load_progress(view));
     update_status();
+    revive_if_dead(view); /* reload a killed tab when the user switches to it */
 }
 
 static void on_counted_matches(WebKitFindController* fc, guint count, gpointer data);
@@ -401,6 +449,24 @@ static gboolean on_decide_policy(WebKitWebView* view, WebKitPolicyDecision* deci
     return TRUE;
 }
 
+/* Tint the web view's base (the canvas shown before/where the page paints) to the
+ * system scheme, so a fresh navigation flashes dark in dark mode instead of the
+ * default opaque white. The page's own background paints over this once it commits,
+ * so it only affects the loading flash and any page with a transparent canvas. */
+static void apply_view_background(WebKitWebView* view)
+{
+    gboolean dark = FALSE;
+    if (iface_settings != NULL) {
+        char* scheme = g_settings_get_string(iface_settings, "color-scheme");
+        dark = g_strcmp0(scheme, "prefer-dark") == 0;
+        g_free(scheme);
+    }
+    GdkRGBA c = dark
+        ? (GdkRGBA) { 0.180, 0.204, 0.251, 1.0 } /* Nord polar night #2E3440 */
+        : (GdkRGBA) { 1.0, 1.0, 1.0, 1.0 };
+    webkit_web_view_set_background_color(view, &c);
+}
+
 static WebKitWebView* append_tab(void)
 {
     WebKitWebView* view = g_object_new(WEBKIT_TYPE_WEB_VIEW,
@@ -409,6 +475,7 @@ static WebKitWebView* append_tab(void)
         "web-context", get_shared_web_context(),
         NULL);
     NULLCHECK(view);
+    apply_view_background(view);
 
     webkit_settings_set_user_agent(get_shared_settings(), "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15");
 
@@ -428,6 +495,7 @@ static WebKitWebView* append_tab(void)
     gtk_box_append(tabbar, btn);
 
     g_signal_connect(view, "create", G_CALLBACK(on_create_tab), NULL);
+    g_signal_connect(view, "web-process-terminated", G_CALLBACK(on_web_process_terminated), NULL);
     g_signal_connect(view, "decide-policy", G_CALLBACK(on_decide_policy), NULL);
     g_signal_connect(view, "notify::favicon", G_CALLBACK(on_favicon_notify), NULL);
     g_signal_connect(webkit_web_view_get_find_controller(view), "counted-matches", G_CALLBACK(on_counted_matches), NULL);
@@ -991,14 +1059,22 @@ static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval
 /* --------------------------------------------------------------- theme */
 /* Chrome stays pinned to THEME_NAME (always dark); only the website's
  * prefers-color-scheme follows the system, via gtk-application-prefer-dark-theme. */
-static GSettings* iface_settings = NULL;
 
 static void apply_color_scheme(void)
 {
     char* scheme = g_settings_get_string(iface_settings, "color-scheme");
-    g_object_set(gtk_settings_get_default(),
-        "gtk-application-prefer-dark-theme", g_strcmp0(scheme, "prefer-dark") == 0, NULL);
+    gboolean dark = g_strcmp0(scheme, "prefer-dark") == 0;
     g_free(scheme);
+
+    g_object_set(gtk_settings_get_default(),
+        "gtk-application-prefer-dark-theme", dark, NULL);
+
+    /* Re-tint the loading canvas of every open tab to match (see apply_view_background). */
+    if (notebook != NULL) {
+        int n = gtk_notebook_get_n_pages(notebook);
+        for (int i = 0; i < n; i++)
+            apply_view_background(WEBKIT_WEB_VIEW(gtk_notebook_get_nth_page(notebook, i)));
+    }
 }
 
 static void setup_theme(void)

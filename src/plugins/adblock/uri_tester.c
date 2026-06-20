@@ -44,6 +44,7 @@ struct _AdblockUriTester {
     GRegex* regex_pattern;
     GRegex* regex_subdocument;
 
+    GDataInputStream* load_stream; /* open only while incrementally compiling */
     gboolean loaded;
 };
 
@@ -200,10 +201,14 @@ fixup_regexp(const char* prefix, char* src)
         case '(':
         case ')':
         case '\\':
-            g_string_append_printf(str, "\\%c", *src);
+            /* g_string_append_c, not append_printf("%c"): this runs for every
+             * request URI during matching (a hot path), so avoid printf parsing
+             * the format string for a single character. */
+            g_string_append_c(str, '\\');
+            g_string_append_c(str, *src);
             break;
         default:
-            g_string_append_printf(str, "%c", *src);
+            g_string_append_c(str, *src);
             break;
         }
         src++;
@@ -371,24 +376,21 @@ parse_line(AdblockUriTester* tester,
     add_url_pattern(tester, "", "uri", line, whitelist);
 }
 
+/* Open the filter file for incremental reading. On any failure the tester is
+ * marked loaded (so test_uri stays fail-open) and no stream is left behind. */
 static void
-load_filters_sync(AdblockUriTester* tester)
+load_begin(AdblockUriTester* tester)
 {
     GFile* file;
     GFileInputStream* stream;
-    GDataInputStream* data_stream;
     GError* error = NULL;
-    char* line;
 
-    if (!tester->filter_file_path)
-        return;
-
-    file = g_file_new_for_path(tester->filter_file_path);
-    if (!g_file_query_exists(file, NULL)) {
-        g_object_unref(file);
+    if (!tester->filter_file_path) {
+        tester->loaded = TRUE;
         return;
     }
 
+    file = g_file_new_for_path(tester->filter_file_path);
     stream = g_file_read(file, NULL, &error);
     g_object_unref(file);
 
@@ -397,19 +399,12 @@ load_filters_sync(AdblockUriTester* tester)
             g_warning("Failed to open filter file: %s", error->message);
             g_error_free(error);
         }
+        tester->loaded = TRUE;
         return;
     }
 
-    data_stream = g_data_input_stream_new(G_INPUT_STREAM(stream));
+    tester->load_stream = g_data_input_stream_new(G_INPUT_STREAM(stream));
     g_object_unref(stream);
-
-    while ((line = g_data_input_stream_read_line(data_stream, NULL, NULL, NULL)) != NULL) {
-        parse_line(tester, line, FALSE);
-        g_free(line);
-    }
-
-    g_object_unref(data_stream);
-    tester->loaded = TRUE;
 }
 
 static void
@@ -467,6 +462,7 @@ adblock_uri_tester_finalize(GObject* object)
     AdblockUriTester* tester = ADBLOCK_URI_TESTER(object);
 
     g_free(tester->filter_file_path);
+    g_clear_object(&tester->load_stream);
 
     g_hash_table_destroy(tester->pattern);
     g_hash_table_destroy(tester->keys);
@@ -509,11 +505,32 @@ adblock_uri_tester_new(const char* filter_file_path)
         "filter-file-path", filter_file_path, NULL));
 }
 
-void adblock_uri_tester_load(AdblockUriTester* tester)
+gboolean adblock_uri_tester_load_step(AdblockUriTester* tester, guint max_lines)
 {
+    char* line;
+    guint n = 0;
+
     if (tester->loaded)
-        return;
-    load_filters_sync(tester);
+        return FALSE;
+    if (!tester->load_stream) {
+        load_begin(tester);
+        if (!tester->load_stream) /* open failed -> loaded set above */
+            return FALSE;
+    }
+
+    while (n < max_lines
+        && (line = g_data_input_stream_read_line(tester->load_stream, NULL, NULL, NULL)) != NULL) {
+        parse_line(tester, line, FALSE);
+        g_free(line);
+        n++;
+    }
+
+    if (n < max_lines) { /* short read -> end of file (or read error): we're done */
+        g_clear_object(&tester->load_stream);
+        tester->loaded = TRUE;
+        return FALSE;
+    }
+    return TRUE; /* a full batch read; more may remain */
 }
 
 gboolean

@@ -53,19 +53,26 @@ on_send_request(WebKitWebPage* page,
     return FALSE; /* Allow the request */
 }
 
+/* Lines compiled per idle tick. The combined EasyList is ~137k rules and each
+ * rule compiles to a GRegex, which is far too much to do in one go on the
+ * web-process main thread — that thread also parses, lays out and PAINTS the
+ * page, so a single bulk compile freezes the first navigation on a white screen
+ * for seconds. Compiling a small batch per idle tick yields back to the run loop
+ * between batches, so rendering proceeds and the load just gets filtered a beat
+ * later. Keep this small enough that one batch is well under a frame. */
+#define ADBLOCK_LOAD_BATCH 800
+
 /*
- * Compile the filter list lazily, off the web-process startup path.
- *
- * The combined EasyList is large and compiling a regex per rule takes a noticeable
- * chunk of time. Doing it here (at the next main-loop idle) instead of inside
- * initialize() means the first navigation isn't blocked waiting for it; requests
- * that arrive before it finishes simply pass through unfiltered
- * (adblock_uri_tester_test_uri returns FALSE until tester->loaded is set).
+ * Compile the filter list incrementally, off the web-process startup path and
+ * without ever blocking the main thread for long. Requests that arrive before it
+ * finishes simply pass through unfiltered (adblock_uri_tester_test_uri returns
+ * FALSE until the tester is fully loaded).
  */
 static gboolean
 load_filters_idle(gpointer user_data G_GNUC_UNUSED)
 {
-    adblock_uri_tester_load(tester);
+    if (adblock_uri_tester_load_step(tester, ADBLOCK_LOAD_BATCH))
+        return G_SOURCE_CONTINUE; /* more rules remain; compile the next batch */
     g_debug("[lightbrowse-adblock] Loaded filters from %s", ADBLOCK_FILTERLIST_PATH);
     return G_SOURCE_REMOVE;
 }
@@ -118,7 +125,8 @@ webkit_web_process_extension_initialize_with_user_data(WebKitWebProcessExtension
     /* Create the tester now but compile the filters at the next idle, so the
      * first page load isn't blocked behind the (large) list compile. */
     tester = adblock_uri_tester_new(ADBLOCK_FILTERLIST_PATH);
-    g_idle_add(load_filters_idle, NULL);
+    /* Low priority so the in-flight page load always wins the main thread. */
+    g_idle_add_full(G_PRIORITY_LOW, load_filters_idle, NULL, NULL);
 
     /* Connect to page-created to hook into each new page */
     g_signal_connect(extension, "page-created", G_CALLBACK(on_page_created), NULL);

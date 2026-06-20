@@ -31,7 +31,10 @@ G_BEGIN_DECLS
 G_DECLARE_FINAL_TYPE(AdblockUriTester, adblock_uri_tester, ADBLOCK, URI_TESTER, GObject)
 
 AdblockUriTester* adblock_uri_tester_new(const char* filter_file_path);
-void adblock_uri_tester_load(AdblockUriTester* tester);
+/* Incremental compile: load_step parses up to max_lines per call so the caller
+ * can spread the (large) filter compile across idle ticks without blocking the
+ * thread. Returns TRUE while more lines remain, FALSE once fully loaded. */
+gboolean adblock_uri_tester_load_step(AdblockUriTester* tester, guint max_lines);
 gboolean adblock_uri_tester_test_uri(AdblockUriTester* tester,
     const char* request_uri,
     const char* page_uri);
