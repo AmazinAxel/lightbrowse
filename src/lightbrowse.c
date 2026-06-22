@@ -16,7 +16,7 @@
 static const char* CSS =
     /* Root: pin the window dark so the GTK theme's light bg never shows in any gap. */
     "window { background: #2E3440; color: #ECEFF4; }"
-    ".webarea, .webarea > stack { background: #000000; }"
+    ".webarea, .webarea > stack { background: #2E3440; }"
     ".tabbar { background: #3B4252; border-right: 0.25rem solid #5e81ac; padding: 4px; }"
     ".tab { padding: 4px; border: 0.2rem solid #4C566A; border-radius: 4px; background: #3B4252; color: #ECEFF4; outline: none; box-shadow: none; transition: border-color .1s ease; }"
     ".tab.active { border-color: #5e81ac; }"
@@ -95,6 +95,7 @@ static GSettings* iface_settings = NULL;
 /* Forward declarations */
 static void notebook_create_new_tab(const char* uri);
 static WebKitWebView* current_view(void);
+static void do_find(const char* text);
 static void session_save(void);
 static void update_status(void);
 static void on_download_started(WebKitNetworkSession* session, WebKitDownload* download, gpointer data);
@@ -326,6 +327,12 @@ static void status_set_link(WebKitWebView* view, const char* uri)
     update_status();
 }
 
+/* Restyle the page's text selection to a dark-blue wash with white text. Applies
+ * to any selection, including the current match WebKit selects while finding --
+ * which otherwise shows the faint, low-contrast default selection colour. */
+static const char* SELECTION_CSS =
+    "::selection { background-color: #5E81AC !important; color: #FFFFFF !important; }";
+
 /* Report the focused link (keyboard tabbing) the way hover reports it. */
 static const char* LINK_FOCUS_JS =
     "document.addEventListener('focusin',function(e){"
@@ -547,6 +554,11 @@ static void on_switch_page(GtkNotebook* nb, GtkWidget* page, guint n, gpointer d
         gtk_progress_bar_set_fraction(progress, webkit_web_view_get_estimated_load_progress(view));
     update_status();
     revive_if_dead(view); /* reload a killed tab when the user switches to it */
+
+    /* Re-run the find against the now-current tab so its matches/highlight
+     * reflect the page the user is actually looking at. */
+    if (gtk_widget_get_visible(findbar))
+        do_find(gtk_editable_get_text(GTK_EDITABLE(find_entry)));
 }
 
 static void on_counted_matches(WebKitFindController* fc, guint count, gpointer data);
@@ -578,16 +590,23 @@ static gboolean on_decide_policy(WebKitWebView* view, WebKitPolicyDecision* deci
     return TRUE;
 }
 
-/* Tint the web view's base (the canvas shown before/where the page paints) to black,
- * always, so a fresh navigation flashes black instead of the default opaque white,
- * regardless of the system light/dark setting. The page's own background paints over
- * this once it commits, so it only affects the loading flash and any page with a
- * transparent canvas. */
+/* Tint the web view's base (the canvas shown before/where the page paints) to Nord
+ * polar night (#2E3440), always, so a fresh navigation flashes dark instead of the
+ * default opaque white, regardless of the system light/dark setting. The page's own
+ * background paints over this once it commits, so it only affects the loading flash
+ * and any page with a transparent canvas (e.g. error pages). */
 static void apply_view_background(WebKitWebView* view)
 {
-    GdkRGBA c = { 0.0, 0.0, 0.0, 1.0 };
+    GdkRGBA c = { 0.180, 0.204, 0.251, 1.0 }; /* Nord polar night #2E3440 */
     webkit_web_view_set_background_color(view, &c);
 }
+
+/* WebKit's built-in error page sets no colours of its own — it relied on the UA
+ * default white canvas + black text, so on our dark canvas its text is invisible.
+ * This user-level (low-priority) stylesheet gives a Nord-white default text colour:
+ * it only takes effect where the page itself sets no colour (the error page, plain
+ * documents), and is overridden by any real site that styles its own text. */
+static const char* DEFAULT_TEXT_CSS = "html { color: #ECEFF4; }";
 
 /* When `related` is non-NULL the new view is a popup (window.open / target=_blank):
  * constructing it with "related-view" keeps it in the opener's web process and
@@ -644,6 +663,22 @@ static WebKitWebView* append_tab(WebKitWebView* related)
         WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
     webkit_user_content_manager_add_script(ucm, script);
     webkit_user_script_unref(script);
+
+    /* Author level (not user level): WebKit's selection painting only reliably
+     * honours ::selection rules from the author origin. !important keeps us ahead
+     * of a page's own selection styling. */
+    WebKitUserStyleSheet* style = webkit_user_style_sheet_new(SELECTION_CSS,
+        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_STYLE_LEVEL_AUTHOR, NULL, NULL);
+    webkit_user_content_manager_add_style_sheet(ucm, style);
+    webkit_user_style_sheet_unref(style);
+
+    /* Top frame only: a Nord-white text default so the error page (and any other
+     * colourless document) stays legible on the dark canvas, without recolouring
+     * subframes of real sites. USER level keeps it a fallback under author styles. */
+    WebKitUserStyleSheet* text = webkit_user_style_sheet_new(DEFAULT_TEXT_CSS,
+        WEBKIT_USER_CONTENT_INJECT_TOP_FRAME, WEBKIT_USER_STYLE_LEVEL_USER, NULL, NULL);
+    webkit_user_content_manager_add_style_sheet(ucm, text);
+    webkit_user_style_sheet_unref(text);
 
     int n = gtk_notebook_append_page(notebook, GTK_WIDGET(view), NULL);
     gtk_notebook_set_current_page(notebook, n);
@@ -948,6 +983,36 @@ static void on_counted_matches(WebKitFindController* fc, guint count, gpointer d
     update_find_label();
 }
 
+/* (Re)issue a fresh search on the live DOM. WebKit's search() both re-highlights
+ * all matches and advances the selection to the next match in document order, so
+ * calling it on every step keeps results up to date (content revealed since the
+ * last search is picked up) without glitching the order -- it's one step, not two.
+ * count_matches refreshes the "N of M" total against the same live DOM. */
+static void find_step(WebKitFindOptions dir)
+{
+    WebKitWebView* v = current_view();
+    if (v == NULL)
+        return;
+    const char* text = gtk_editable_get_text(GTK_EDITABLE(find_entry));
+    WebKitFindController* fc = webkit_web_view_get_find_controller(v);
+    WebKitFindOptions opts = WEBKIT_FIND_OPTIONS_CASE_INSENSITIVE | WEBKIT_FIND_OPTIONS_WRAP_AROUND | dir;
+    if (text[0] == '\0') {
+        webkit_find_controller_search_finish(fc);
+        find_total = 0;
+        find_current = 0;
+    } else {
+        webkit_find_controller_count_matches(fc, text, opts, G_MAXUINT);
+        webkit_find_controller_search(fc, text, opts, G_MAXUINT);
+        if (find_total > 0)
+            find_current = (dir & WEBKIT_FIND_OPTIONS_BACKWARDS)
+                ? (find_current + find_total - 2) % find_total + 1
+                : (find_current % find_total) + 1;
+        else
+            find_current = 1;
+    }
+    update_find_label();
+}
+
 static void do_find(const char* text)
 {
     WebKitWebView* v = current_view();
@@ -974,24 +1039,12 @@ static void on_find_changed(GtkEditable* editable, gpointer data)
 
 static void find_next(void)
 {
-    WebKitWebView* v = current_view();
-    if (v == NULL)
-        return;
-    webkit_find_controller_search_next(webkit_web_view_get_find_controller(v));
-    if (find_total > 0)
-        find_current = (find_current % find_total) + 1;
-    update_find_label();
+    find_step(WEBKIT_FIND_OPTIONS_NONE);
 }
 
 static void find_prev(void)
 {
-    WebKitWebView* v = current_view();
-    if (v == NULL)
-        return;
-    webkit_find_controller_search_previous(webkit_web_view_get_find_controller(v));
-    if (find_total > 0)
-        find_current = (find_current + find_total - 2) % find_total + 1;
-    update_find_label();
+    find_step(WEBKIT_FIND_OPTIONS_BACKWARDS);
 }
 
 static void on_find_activate(GtkEntry* entry, gpointer data)
