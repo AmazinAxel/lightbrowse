@@ -13,7 +13,9 @@
 #define FUZZY_RESULTS 3 // max bookmark suggestions shown in the search modal
 #define TAB_ICON_SIZE 24 // px, favicon size in the vertical tab strip
 #define SEARCH "https://bing.com/search?q=%s"
-#define THEME_NAME "Graphite-nord-dark" // GTK UI theme; the UI is always dark
+/* The UI chrome is always dark — its Nord colours are hardcoded in CSS (see the
+ * CSS block in lightbrowse.c), not via a GTK theme name. The GTK theme itself is
+ * left to follow the system so websites' prefers-color-scheme stays correct. */
 
 #define DATA_DIR "/home/alec/.config/lightbrowse"
 #define BOOKMARKS_DIR DATA_DIR "/bookmarks"

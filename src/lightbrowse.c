@@ -14,18 +14,25 @@
  * surface #3B4252, fg #ECEFF4, accent #5E81AC. The loading canvas is pure black
  * (see apply_view_background) so a navigation flash is never a bright white. */
 static const char* CSS =
+    /* Root: pin the window dark so the GTK theme's light bg never shows in any gap. */
+    "window { background: #2E3440; color: #ECEFF4; }"
     ".webarea, .webarea > stack { background: #000000; }"
     ".tabbar { background: #3B4252; border-right: 0.25rem solid #5e81ac; padding: 4px; }"
-    ".tab { padding: 4px; border: 0.2rem solid #4C566A; border-radius: 4px; outline: none; box-shadow: none; transition: border-color .1s ease; }"
+    ".tab { padding: 4px; border: 0.2rem solid #4C566A; border-radius: 4px; background: #3B4252; color: #ECEFF4; outline: none; box-shadow: none; transition: border-color .1s ease; }"
     ".tab.active { border-color: #5e81ac; }"
+    ".tab image { color: #ECEFF4; }" /* recolour the symbolic globe placeholder white (real favicons are untouched) */
     ".tab.asleep { opacity: 0.5; }" /* slept tab: web process freed, reopen to reload */
     ".dim { background: alpha(black, 0.3); }"
     ".modal { background: #2E3440; color: #ECEFF4; border: 2px solid #5e81ac; border-radius: 12px; padding: 12px; }"
-    ".modal entry { min-width: 280px; }"
+    ".modal entry { min-width: 280px; background: #3B4252; color: #ECEFF4; border: 1px solid #4C566A; caret-color: #ECEFF4; }"
+    ".modal entry selection { background: #81A1C1; color: #2E3440; }"
     ".modal label { padding: 8px; border: 1px solid #4C566A; background-color: #3B4252; border-radius: 6px; transition: all 120ms ease; }"
     ".modal .selected { background: #81A1C1; color: #ECEFF4; border-color: #D8DEE9; transform: translateY(-2px) scale(1.01); outline: 2px solid #81A1C1; outline-offset: 1px; }"
 
     ".findbar { background: #2E3440; color: #ECEFF4; border: 1px solid #5e81ac; border-radius: 8px; padding: 4px; margin-bottom: 12px; outline: 2px solid #5E81AC; }"
+    ".findbar entry { background: #3B4252; color: #ECEFF4; border: 1px solid #4C566A; caret-color: #ECEFF4; }"
+    ".findbar entry selection { background: #81A1C1; color: #2E3440; }"
+    ".findbar label { color: #ECEFF4; }"
 
     ".statusbar label { color: #ECEFF4; font-size: 0.85em; padding: 2px 4px; background: #3B4252; border-top-right-radius: 6px; }"
     "progressbar.loadbar trough { border: none; background: transparent; border-radius: 0; padding: 0; min-height: 3px; }"
@@ -1207,15 +1214,17 @@ static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval
 }
 
 /* --------------------------------------------------------------- theme */
-/* The chrome is always dark: gtk-theme-name is pinned to THEME_NAME (a dedicated
- * dark GTK theme) and the custom widgets hardcode Nord colours in CSS, so the UI
- * never follows the system light/dark. Only websites follow the system, via
- * gtk-application-prefer-dark-theme, which WebKit maps to prefers-color-scheme. */
+/* The chrome is always dark: every visible chrome widget hardcodes Nord colours
+ * in CSS, so the UI never follows the system light/dark. The GTK theme itself is
+ * deliberately left to follow the system (gtk-application-prefer-dark-theme),
+ * because WebKit maps that to each page's prefers-color-scheme — forcing the GTK
+ * theme dark would drag every website dark too. So: chrome dark via CSS, websites
+ * dark/light via the (untouched) system theme. */
 
 static void apply_color_scheme(void)
 {
     /* The sole purpose of this is to let websites inherit the system light/dark;
-     * the chrome itself is unaffected (pinned dark in setup_theme). */
+     * the chrome is unaffected (its colours are hardcoded in CSS). */
     char* scheme = g_settings_get_string(iface_settings, "color-scheme");
     gboolean dark = g_strcmp0(scheme, "prefer-dark") == 0;
     g_free(scheme);
@@ -1226,11 +1235,6 @@ static void apply_color_scheme(void)
 
 static void setup_theme(void)
 {
-    /* Pin the chrome to a dedicated dark theme so the UI stays dark regardless of
-     * the system setting (gtk-application-prefer-dark-theme is left to follow the
-     * system for the webviews' sake, and an explicitly-dark theme ignores it). */
-    g_object_set(gtk_settings_get_default(), "gtk-theme-name", THEME_NAME, NULL);
-
     GSettingsSchemaSource* src = g_settings_schema_source_get_default();
     if (src == NULL)
         return;
