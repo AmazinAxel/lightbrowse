@@ -1159,7 +1159,12 @@ static void handle_shortcut(func id)
             reopen_closed_tab();
             break;
         case show_finder:
-            find_show();
+            /* First press opens the bar at the first match; pressing it again
+             * while open advances to the next match and updates "N of M". */
+            if (gtk_widget_get_visible(findbar))
+                find_next();
+            else
+                find_show();
             break;
         case find_reset:
             do_find(gtk_editable_get_text(GTK_EDITABLE(find_entry)));
