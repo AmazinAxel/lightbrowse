@@ -9,21 +9,25 @@
 #include "config.h"
 #include "plugins/plugins.h"
 
+/* The chrome is hardcoded to Graphite-nord-dark colours so the UI is always dark,
+ * independent of the system light/dark setting. Nord palette: bg #2E3440, a lighter
+ * surface #3B4252, fg #ECEFF4, accent #5E81AC. The loading canvas is pure black
+ * (see apply_view_background) so a navigation flash is never a bright white. */
 static const char* CSS =
-    ".webarea, .webarea > stack { background: #ffffff; }"
-    ".tabbar { background: shade(@theme_bg_color, 1.2); border-right: 0.25rem solid #5e81ac; padding: 4px; }"
+    ".webarea, .webarea > stack { background: #000000; }"
+    ".tabbar { background: #3B4252; border-right: 0.25rem solid #5e81ac; padding: 4px; }"
     ".tab { padding: 4px; border: 0.2rem solid #4C566A; border-radius: 4px; outline: none; box-shadow: none; transition: border-color .1s ease; }"
     ".tab.active { border-color: #5e81ac; }"
     ".tab.asleep { opacity: 0.5; }" /* slept tab: web process freed, reopen to reload */
     ".dim { background: alpha(black, 0.3); }"
-    ".modal { background: @theme_bg_color; color: @theme_fg_color; border: 2px solid #5e81ac; border-radius: 12px; padding: 12px; }"
+    ".modal { background: #2E3440; color: #ECEFF4; border: 2px solid #5e81ac; border-radius: 12px; padding: 12px; }"
     ".modal entry { min-width: 280px; }"
     ".modal label { padding: 8px; border: 1px solid #4C566A; background-color: #3B4252; border-radius: 6px; transition: all 120ms ease; }"
     ".modal .selected { background: #81A1C1; color: #ECEFF4; border-color: #D8DEE9; transform: translateY(-2px) scale(1.01); outline: 2px solid #81A1C1; outline-offset: 1px; }"
 
-    ".findbar { background: @theme_bg_color; color: @theme_fg_color; border: 1px solid #5e81ac; border-radius: 8px; padding: 4px; margin-bottom: 12px; outline: 2px solid #5E81AC; }"
+    ".findbar { background: #2E3440; color: #ECEFF4; border: 1px solid #5e81ac; border-radius: 8px; padding: 4px; margin-bottom: 12px; outline: 2px solid #5E81AC; }"
 
-    ".statusbar label { color: @theme_fg_color; font-size: 0.85em; padding: 2px 4px; background: shade(@theme_bg_color, 1.2); border-top-right-radius: 6px; }"
+    ".statusbar label { color: #ECEFF4; font-size: 0.85em; padding: 2px 4px; background: #3B4252; border-top-right-radius: 6px; }"
     "progressbar.loadbar trough { border: none; background: transparent; border-radius: 0; padding: 0; min-height: 3px; }"
     "progressbar.loadbar progress { border: none; border-radius: 0; background: #5e81ac; }"
     "progressbar.downloadbar trough { border: none; background: transparent; border-radius: 0; padding: 0; min-height: 3px; }"
@@ -567,21 +571,14 @@ static gboolean on_decide_policy(WebKitWebView* view, WebKitPolicyDecision* deci
     return TRUE;
 }
 
-/* Tint the web view's base (the canvas shown before/where the page paints) to the
- * system scheme, so a fresh navigation flashes dark in dark mode instead of the
- * default opaque white. The page's own background paints over this once it commits,
- * so it only affects the loading flash and any page with a transparent canvas. */
+/* Tint the web view's base (the canvas shown before/where the page paints) to black,
+ * always, so a fresh navigation flashes black instead of the default opaque white,
+ * regardless of the system light/dark setting. The page's own background paints over
+ * this once it commits, so it only affects the loading flash and any page with a
+ * transparent canvas. */
 static void apply_view_background(WebKitWebView* view)
 {
-    gboolean dark = FALSE;
-    if (iface_settings != NULL) {
-        char* scheme = g_settings_get_string(iface_settings, "color-scheme");
-        dark = g_strcmp0(scheme, "prefer-dark") == 0;
-        g_free(scheme);
-    }
-    GdkRGBA c = dark
-        ? (GdkRGBA) { 0.180, 0.204, 0.251, 1.0 } /* Nord polar night #2E3440 */
-        : (GdkRGBA) { 1.0, 1.0, 1.0, 1.0 };
+    GdkRGBA c = { 0.0, 0.0, 0.0, 1.0 };
     webkit_web_view_set_background_color(view, &c);
 }
 
@@ -1210,28 +1207,30 @@ static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval
 }
 
 /* --------------------------------------------------------------- theme */
-/* Chrome stays pinned to THEME_NAME (always dark); only the website's
- * prefers-color-scheme follows the system, via gtk-application-prefer-dark-theme. */
+/* The chrome is always dark: gtk-theme-name is pinned to THEME_NAME (a dedicated
+ * dark GTK theme) and the custom widgets hardcode Nord colours in CSS, so the UI
+ * never follows the system light/dark. Only websites follow the system, via
+ * gtk-application-prefer-dark-theme, which WebKit maps to prefers-color-scheme. */
 
 static void apply_color_scheme(void)
 {
+    /* The sole purpose of this is to let websites inherit the system light/dark;
+     * the chrome itself is unaffected (pinned dark in setup_theme). */
     char* scheme = g_settings_get_string(iface_settings, "color-scheme");
     gboolean dark = g_strcmp0(scheme, "prefer-dark") == 0;
     g_free(scheme);
 
     g_object_set(gtk_settings_get_default(),
         "gtk-application-prefer-dark-theme", dark, NULL);
-
-    /* Re-tint the loading canvas of every open tab to match (see apply_view_background). */
-    if (notebook != NULL) {
-        int n = gtk_notebook_get_n_pages(notebook);
-        for (int i = 0; i < n; i++)
-            apply_view_background(WEBKIT_WEB_VIEW(gtk_notebook_get_nth_page(notebook, i)));
-    }
 }
 
 static void setup_theme(void)
 {
+    /* Pin the chrome to a dedicated dark theme so the UI stays dark regardless of
+     * the system setting (gtk-application-prefer-dark-theme is left to follow the
+     * system for the webviews' sake, and an explicitly-dark theme ignores it). */
+    g_object_set(gtk_settings_get_default(), "gtk-theme-name", THEME_NAME, NULL);
+
     GSettingsSchemaSource* src = g_settings_schema_source_get_default();
     if (src == NULL)
         return;
