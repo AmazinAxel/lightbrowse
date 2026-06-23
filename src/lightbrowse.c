@@ -1066,8 +1066,9 @@ static void find_highlight(const char* text)
         find_total = 0;
         find_current = 0;
     } else {
+        /* Re-highlight the matches but leave find_current where it was so the
+         * "N of M" position is preserved -- Ctrl+F must not move the selection. */
         webkit_find_controller_count_matches(fc, text, opts, G_MAXUINT);
-        find_current = 0;
     }
     update_find_label();
 }
