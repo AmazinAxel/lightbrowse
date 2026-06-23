@@ -1052,12 +1052,32 @@ static void on_find_activate(GtkEntry* entry, gpointer data)
     find_next(); /* Enter = next; Shift+Enter (handled in keypress) = previous */
 }
 
+/* Highlight all matches for text without scrolling to/selecting one --
+ * Ctrl+F should only focus the box, not move through results. */
+static void find_highlight(const char* text)
+{
+    WebKitWebView* v = current_view();
+    if (v == NULL)
+        return;
+    WebKitFindController* fc = webkit_web_view_get_find_controller(v);
+    WebKitFindOptions opts = WEBKIT_FIND_OPTIONS_CASE_INSENSITIVE | WEBKIT_FIND_OPTIONS_WRAP_AROUND;
+    if (text[0] == '\0') {
+        webkit_find_controller_search_finish(fc);
+        find_total = 0;
+        find_current = 0;
+    } else {
+        webkit_find_controller_count_matches(fc, text, opts, G_MAXUINT);
+        find_current = 0;
+    }
+    update_find_label();
+}
+
 static void find_show(void)
 {
     gtk_widget_set_visible(findbar, TRUE);
     gtk_widget_grab_focus(GTK_WIDGET(find_entry));
     gtk_editable_select_region(GTK_EDITABLE(find_entry), 0, -1);
-    do_find(gtk_editable_get_text(GTK_EDITABLE(find_entry)));
+    find_highlight(gtk_editable_get_text(GTK_EDITABLE(find_entry)));
 }
 
 static void find_hide(void)
@@ -1159,12 +1179,9 @@ static void handle_shortcut(func id)
             reopen_closed_tab();
             break;
         case show_finder:
-            /* First press opens the bar at the first match; pressing it again
-             * while open advances to the next match and updates "N of M". */
-            if (gtk_widget_get_visible(findbar))
-                find_next();
-            else
-                find_show();
+            /* Ctrl+F only opens/focuses the bar and highlights matches; it never
+             * moves through results -- only Enter advances to the next match. */
+            find_show();
             break;
         case find_reset:
             do_find(gtk_editable_get_text(GTK_EDITABLE(find_entry)));
