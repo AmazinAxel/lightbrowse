@@ -48,9 +48,14 @@ static GtkBox* tabbar; /* vertical favicon strip */
 static gboolean tabbar_visible = TRUE;
 static int num_tabs = 0;
 
-/* Most-recently-used tab tracking (alt+tab jumps to the previously-viewed tab). */
-static GtkWidget* mru_current = NULL; /* the page we currently consider active */
-static GtkWidget* mru_prev = NULL;    /* the page active before it (alt+tab target) */
+/* Most-recently-used tab history (alt+tab walks back through it). The front
+ * (index 0) is the current tab, except during an active alt+tab walk: then the
+ * displayed tab is mru[alt_walk] and the list is only reshuffled once the user
+ * releases Alt, so repeated Tab presses keep stepping deeper into history. */
+static GtkWidget* mru[MRU_HISTORY];
+static int mru_len = 0;
+static int alt_walk = -1;            /* index into mru during a walk; -1 when idle */
+static gboolean alt_switch = FALSE;  /* TRUE while the walk drives the page switch itself */
 
 /* Modal (search / bookmark) */
 typedef enum { MODAL_NONE, MODAL_SEARCH, MODAL_BOOKMARK } ModalMode;
@@ -99,7 +104,8 @@ static void do_find(const char* text);
 static void session_save(void);
 static void update_status(void);
 static void on_download_started(WebKitNetworkSession* session, WebKitDownload* download, gpointer data);
-static void forget_mru(GtkWidget* page);
+static void mru_promote(GtkWidget* page);
+static void mru_remove(GtkWidget* page);
 static void tab_set_asleep(WebKitWebView* view, gboolean asleep);
 
 /* ---------------------------------------------------------------- URI load */
@@ -290,6 +296,7 @@ static gboolean close_blank_download_tab(gpointer data)
     int n = gtk_notebook_page_num(notebook, GTK_WIDGET(view));
     if (n >= 0 && num_tabs > 1
         && webkit_back_forward_list_get_current_item(webkit_web_view_get_back_forward_list(view)) == NULL) {
+        mru_remove(GTK_WIDGET(view));
         GtkWidget* btn = g_object_get_data(G_OBJECT(view), "button");
         if (btn != NULL)
             gtk_box_remove(tabbar, btn);
@@ -539,10 +546,12 @@ static void on_switch_page(GtkNotebook* nb, GtkWidget* page, guint n, gpointer d
     if (btn != NULL)
         gtk_widget_add_css_class(btn, "active");
 
-    /* Track most-recently-used order so alt+tab can jump to the previous tab. */
-    if (page != mru_current) {
-        mru_prev = mru_current;
-        mru_current = page;
+    /* Track most-recently-used order so alt+tab can walk back through it. While a
+     * walk is driving the switch itself, leave the order untouched: it's committed
+     * only when the user releases Alt (see handle_signal_keyrelease). */
+    if (!alt_switch) {
+        mru_promote(page);
+        alt_walk = -1; /* a genuine switch ends any in-progress walk */
     }
 
     /* Resync the status bar to the now-current tab. */
@@ -704,13 +713,38 @@ static GtkWidget* on_create_tab(WebKitWebView* self,
     return GTK_WIDGET(append_tab(self));
 }
 
-/* A page about to be removed must not linger as an alt+tab target. */
-static void forget_mru(GtkWidget* page)
+/* The page's slot in the MRU list, or -1 if it isn't tracked. */
+static int mru_index(GtkWidget* page)
 {
-    if (mru_current == page)
-        mru_current = NULL;
-    if (mru_prev == page)
-        mru_prev = NULL;
+    for (int i = 0; i < mru_len; i++)
+        if (mru[i] == page)
+            return i;
+    return -1;
+}
+
+/* Move (or insert) a page at the front of the MRU list, capped at MRU_HISTORY
+ * (the oldest entry falls off the back once it's full). */
+static void mru_promote(GtkWidget* page)
+{
+    int at = mru_index(page);
+    if (at < 0)
+        at = (mru_len < MRU_HISTORY) ? mru_len++ : MRU_HISTORY - 1; /* drop the oldest */
+    for (int i = at; i > 0; i--)
+        mru[i] = mru[i - 1];
+    mru[0] = page;
+}
+
+/* Drop a page from the MRU list (its tab was closed) so it can't linger as an
+ * alt+tab target. Reopening it later (ctrl+shift+t) re-promotes it to the front. */
+static void mru_remove(GtkWidget* page)
+{
+    int at = mru_index(page);
+    if (at < 0)
+        return;
+    for (int i = at; i < mru_len - 1; i++)
+        mru[i] = mru[i + 1];
+    mru[--mru_len] = NULL;
+    alt_walk = -1; /* the list shifted under any walk in progress; restart it */
 }
 
 static void push_closed(WebKitWebViewSessionState* st)
@@ -730,7 +764,7 @@ static void close_current_tab(void)
         return;
     push_closed(webkit_web_view_get_session_state(view));
 
-    forget_mru(GTK_WIDGET(view));
+    mru_remove(GTK_WIDGET(view));
     GtkWidget* btn = g_object_get_data(G_OBJECT(view), "button");
     if (btn != NULL)
         gtk_box_remove(tabbar, btn);
@@ -1138,14 +1172,25 @@ static void handle_shortcut(func id)
                 gtk_notebook_set_current_page(notebook, k + 1);
             break;
         }
-        case last_tab: { /* alt+tab: jump back to the previously-viewed tab */
-            GtkWidget* target = mru_prev; /* on_switch_page reassigns mru_prev, so grab it first */
-            if (target != NULL) {
-                int k = gtk_notebook_page_num(notebook, target);
-                if (k >= 0) {
-                    gtk_notebook_set_current_page(notebook, k);
-                    revive_if_dead(WEBKIT_WEB_VIEW(target)); /* wake it if it was slept */
-                }
+        case last_tab: { /* alt+tab: walk back through the most-recently-used tabs */
+            if (mru_len < 2)
+                break;
+            if (alt_walk < 0)
+                alt_walk = 0; /* start the walk at the current (front) tab */
+            /* Step to the next entry, wrapping, skipping any whose page has gone. */
+            int k = -1;
+            for (int tries = 0; tries < mru_len; tries++) {
+                alt_walk = (alt_walk + 1) % mru_len;
+                k = gtk_notebook_page_num(notebook, mru[alt_walk]);
+                if (k >= 0)
+                    break;
+            }
+            if (k >= 0) {
+                GtkWidget* target = mru[alt_walk];
+                alt_switch = TRUE; /* don't let this switch reshuffle the MRU order */
+                gtk_notebook_set_current_page(notebook, k);
+                alt_switch = FALSE;
+                revive_if_dead(WEBKIT_WEB_VIEW(target)); /* wake it if it was slept */
             }
             break;
         }
@@ -1273,6 +1318,20 @@ static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval
         }
     }
     return FALSE;
+}
+
+/* Releasing Alt commits the alt+tab walk: the tab the user landed on becomes the
+ * new most-recent. Deferring the reshuffle to here is what lets repeated Tab
+ * presses step deeper into history rather than just toggling the top two. */
+static void handle_signal_keyrelease(GtkEventControllerKey* self G_GNUC_UNUSED,
+    guint keyval, guint keycode G_GNUC_UNUSED, GdkModifierType state G_GNUC_UNUSED,
+    gpointer user_data G_GNUC_UNUSED)
+{
+    if ((keyval == GDK_KEY_Alt_L || keyval == GDK_KEY_Alt_R)
+        && alt_walk > 0 && alt_walk < mru_len) {
+        mru_promote(mru[alt_walk]);
+        alt_walk = -1;
+    }
 }
 
 /* --------------------------------------------------------------- theme */
@@ -1459,6 +1518,7 @@ static void ensure_window(void)
     GtkEventController* keys = gtk_event_controller_key_new();
     gtk_event_controller_set_propagation_phase(keys, GTK_PHASE_CAPTURE);
     g_signal_connect(keys, "key-pressed", G_CALLBACK(handle_signal_keypress), NULL);
+    g_signal_connect(keys, "key-released", G_CALLBACK(handle_signal_keyrelease), NULL);
     gtk_widget_add_controller(GTK_WIDGET(window), keys);
 
     setup_theme();

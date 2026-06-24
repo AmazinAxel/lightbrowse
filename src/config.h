@@ -4,6 +4,7 @@
 #define ZOOM_STEPSIZE .1
 #define MAX_NUM_TABS 16 // 0 for inf tabs
 #define CLOSED_TAB_HISTORY 3 // how many closed tabs can be reopened (ctrl+shift+t)
+#define MRU_HISTORY 4 // how many tabs alt+tab walks back through (most-recently-used order)
 /* Tab sleeping is driven by *system* memory pressure, not a fixed timer: tabs only
  * sleep when the machine is actually low on RAM. A slept tab's web process is freed
  * (RAM reclaimed), its button dims to 50%, and reselecting it reloads the page. */
