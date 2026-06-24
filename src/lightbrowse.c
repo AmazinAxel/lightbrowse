@@ -356,8 +356,23 @@ static void on_load_progress(GObject* obj, GParamSpec* pspec, gpointer data)
     gtk_progress_bar_set_fraction(progress, webkit_web_view_get_estimated_load_progress(view));
 }
 
+static void view_set_dark_chrome(WebKitWebView* view, gboolean dark);
+
 static void on_load_changed(WebKitWebView* view, WebKitLoadEvent event, gpointer data)
 {
+    if (event == WEBKIT_LOAD_STARTED) {
+        g_object_set_data(G_OBJECT(view), "load-error", NULL); /* assume this load is fine */
+        view_set_dark_chrome(view, TRUE);                      /* dark pre-paint loading flash */
+    } else if (event == WEBKIT_LOAD_COMMITTED) {
+        /* Keep dark chrome only where the page has no background of its own: the
+         * (transparent) error page, and about: pages like the blank new tab. A real
+         * site has committed its document now, so hand it the plain white UA canvas. */
+        const char* uri = webkit_web_view_get_uri(view);
+        gboolean dark = g_object_get_data(G_OBJECT(view), "load-error") != NULL
+            || uri == NULL || g_str_has_prefix(uri, "about:");
+        view_set_dark_chrome(view, dark);
+    }
+
     if (view != current_view())
         return;
     if (event == WEBKIT_LOAD_STARTED) {
@@ -369,6 +384,17 @@ static void on_load_changed(WebKitWebView* view, WebKitLoadEvent event, gpointer
         page_loading = FALSE;
     }
     update_status();
+}
+
+/* A failed load (DNS failure, TLS error, ...) makes WebKit swap in its built-in
+ * error page, which is transparent and relies on the UA white canvas + black text.
+ * Flag the view so the COMMITTED of that error page keeps the dark chrome (legible
+ * white-on-dark); FALSE lets WebKit render its default error page. */
+static gboolean on_load_failed(WebKitWebView* view, WebKitLoadEvent event,
+    char* failing_uri, GError* error, gpointer data)
+{
+    g_object_set_data(G_OBJECT(view), "load-error", GINT_TO_POINTER(1));
+    return FALSE;
 }
 
 static void on_mouse_target(WebKitWebView* view, WebKitHitTestResult* hit, guint modifiers, gpointer data)
@@ -580,8 +606,16 @@ static gboolean on_decide_policy(WebKitWebView* view, WebKitPolicyDecision* deci
     /* A response WebKit can't render (zip, exe, ...) should download, not show a
      * blank page. WebKit doesn't do this on its own, so force it here. */
     if (type == WEBKIT_POLICY_DECISION_TYPE_RESPONSE) {
-        if (!webkit_response_policy_decision_is_mime_type_supported(
-                WEBKIT_RESPONSE_POLICY_DECISION(decision))) {
+        WebKitResponsePolicyDecision* rpd = WEBKIT_RESPONSE_POLICY_DECISION(decision);
+        /* application/pdf isn't reported as a "supported" MIME, but WebKit's bundled
+         * PDF.js viewer (PDFJSViewer, on by default) renders it — so let it through
+         * and the PDF opens in the tab instead of downloading. Ctrl+S still saves it
+         * to Downloads (see save_current_media). */
+        WebKitURIResponse* resp = webkit_response_policy_decision_get_response(rpd);
+        const char* mime = resp ? webkit_uri_response_get_mime_type(resp) : NULL;
+        if (mime != NULL && g_ascii_strcasecmp(mime, "application/pdf") == 0)
+            return FALSE;
+        if (!webkit_response_policy_decision_is_mime_type_supported(rpd)) {
             webkit_policy_decision_download(decision);
             return TRUE;
         }
@@ -599,23 +633,43 @@ static gboolean on_decide_policy(WebKitWebView* view, WebKitPolicyDecision* deci
     return TRUE;
 }
 
-/* Tint the web view's base (the canvas shown before/where the page paints) to Nord
- * polar night (#2E3440), always, so a fresh navigation flashes dark instead of the
- * default opaque white, regardless of the system light/dark setting. The page's own
- * background paints over this once it commits, so it only affects the loading flash
- * and any page with a transparent canvas (e.g. error pages). */
-static void apply_view_background(WebKitWebView* view)
-{
-    GdkRGBA c = { 0.180, 0.204, 0.251, 1.0 }; /* Nord polar night #2E3440 */
-    webkit_web_view_set_background_color(view, &c);
-}
-
 /* WebKit's built-in error page sets no colours of its own — it relied on the UA
  * default white canvas + black text, so on our dark canvas its text is invisible.
  * This user-level (low-priority) stylesheet gives a Nord-white default text colour:
  * it only takes effect where the page itself sets no colour (the error page, plain
  * documents), and is overridden by any real site that styles its own text. */
 static const char* DEFAULT_TEXT_CSS = "html { color: #ECEFF4; }";
+
+/* Dark chrome = Nord polar-night canvas (#2E3440) + the white-text default above.
+ * It keeps the pre-paint loading flash, about: pages and WebKit's transparent error
+ * page legible on dark. We deliberately DON'T keep it on a real site: many sites set
+ * no background and lean on the UA default white canvas + black text, where the dark
+ * canvas would show through and the forced white text would wash their text out. So
+ * those pages get plain white chrome instead (toggled per-load in on_load_changed).
+ *
+ * Selection styling is always on; the white-text default only in dark mode. We
+ * remove-all + re-add rather than toggle a single sheet to stay off the newer
+ * remove-single-sheet API; our user scripts (link focus) live separately and are
+ * left untouched by remove_all_style_sheets. */
+static void view_set_dark_chrome(WebKitWebView* view, gboolean dark)
+{
+    GdkRGBA dark_c = { 0.180, 0.204, 0.251, 1.0 }; /* Nord polar night #2E3440 */
+    GdkRGBA light_c = { 1.0, 1.0, 1.0, 1.0 };      /* plain UA white */
+    webkit_web_view_set_background_color(view, dark ? &dark_c : &light_c);
+
+    WebKitUserContentManager* ucm = webkit_web_view_get_user_content_manager(view);
+    webkit_user_content_manager_remove_all_style_sheets(ucm);
+    WebKitUserStyleSheet* sel = webkit_user_style_sheet_new(SELECTION_CSS,
+        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_STYLE_LEVEL_AUTHOR, NULL, NULL);
+    webkit_user_content_manager_add_style_sheet(ucm, sel);
+    webkit_user_style_sheet_unref(sel);
+    if (dark) {
+        WebKitUserStyleSheet* text = webkit_user_style_sheet_new(DEFAULT_TEXT_CSS,
+            WEBKIT_USER_CONTENT_INJECT_TOP_FRAME, WEBKIT_USER_STYLE_LEVEL_USER, NULL, NULL);
+        webkit_user_content_manager_add_style_sheet(ucm, text);
+        webkit_user_style_sheet_unref(text);
+    }
+}
 
 /* When `related` is non-NULL the new view is a popup (window.open / target=_blank):
  * constructing it with "related-view" keeps it in the opener's web process and
@@ -636,7 +690,7 @@ static WebKitWebView* append_tab(WebKitWebView* related)
             "web-context", get_shared_web_context(),
             NULL);
     NULLCHECK(view);
-    apply_view_background(view);
+    view_set_dark_chrome(view, TRUE); /* dark until a real page commits (on_load_changed) */
 
     webkit_settings_set_user_agent(get_shared_settings(), "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15");
 
@@ -657,6 +711,7 @@ static WebKitWebView* append_tab(WebKitWebView* related)
 
     g_signal_connect(view, "create", G_CALLBACK(on_create_tab), NULL);
     g_signal_connect(view, "web-process-terminated", G_CALLBACK(on_web_process_terminated), NULL);
+    g_signal_connect(view, "load-failed", G_CALLBACK(on_load_failed), NULL);
     g_signal_connect(view, "decide-policy", G_CALLBACK(on_decide_policy), NULL);
     g_signal_connect(view, "notify::favicon", G_CALLBACK(on_favicon_notify), NULL);
     g_signal_connect(webkit_web_view_get_find_controller(view), "counted-matches", G_CALLBACK(on_counted_matches), NULL);
@@ -673,21 +728,8 @@ static WebKitWebView* append_tab(WebKitWebView* related)
     webkit_user_content_manager_add_script(ucm, script);
     webkit_user_script_unref(script);
 
-    /* Author level (not user level): WebKit's selection painting only reliably
-     * honours ::selection rules from the author origin. !important keeps us ahead
-     * of a page's own selection styling. */
-    WebKitUserStyleSheet* style = webkit_user_style_sheet_new(SELECTION_CSS,
-        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_STYLE_LEVEL_AUTHOR, NULL, NULL);
-    webkit_user_content_manager_add_style_sheet(ucm, style);
-    webkit_user_style_sheet_unref(style);
-
-    /* Top frame only: a Nord-white text default so the error page (and any other
-     * colourless document) stays legible on the dark canvas, without recolouring
-     * subframes of real sites. USER level keeps it a fallback under author styles. */
-    WebKitUserStyleSheet* text = webkit_user_style_sheet_new(DEFAULT_TEXT_CSS,
-        WEBKIT_USER_CONTENT_INJECT_TOP_FRAME, WEBKIT_USER_STYLE_LEVEL_USER, NULL, NULL);
-    webkit_user_content_manager_add_style_sheet(ucm, text);
-    webkit_user_style_sheet_unref(text);
+    /* The selection + (dark-only) default-text stylesheets are installed by
+     * view_set_dark_chrome (called above), which re-runs them on every load. */
 
     int n = gtk_notebook_append_page(notebook, GTK_WIDGET(view), NULL);
     gtk_notebook_set_current_page(notebook, n);
@@ -1262,6 +1304,44 @@ static void handle_shortcut(func id)
     }
 }
 
+/* TRUE if the URL's path ends in ".pdf" (case-insensitive), query string ignored.
+ * The PDF.js viewer shows a PDF inside an HTML document, so the page's MIME type
+ * alone wouldn't reveal it's a PDF — the URL does. */
+static gboolean uri_is_pdf(const char* uri)
+{
+    GUri* u = g_uri_parse(uri, G_URI_FLAGS_NONE, NULL);
+    if (u == NULL)
+        return FALSE;
+    const char* path = g_uri_get_path(u);
+    size_t len = path ? strlen(path) : 0;
+    gboolean pdf = len >= 4 && g_ascii_strcasecmp(path + len - 4, ".pdf") == 0;
+    g_uri_unref(u);
+    return pdf;
+}
+
+/* Ctrl+S handler for a standalone image or PDF tab: save it straight to
+ * DOWNLOADS_DIR through the normal download pipeline (which auto-names and
+ * uniquifies — see on_download_destination). Returns TRUE if it kicked off a save;
+ * FALSE on any other page so the caller lets Ctrl+S pass through to the page. */
+static gboolean save_current_media(WebKitWebView* view)
+{
+    const char* uri = webkit_web_view_get_uri(view);
+    if (uri == NULL || uri[0] == '\0')
+        return FALSE;
+
+    WebKitWebResource* res = webkit_web_view_get_main_resource(view);
+    WebKitURIResponse* resp = res ? webkit_web_resource_get_response(res) : NULL;
+    const char* mime = resp ? webkit_uri_response_get_mime_type(resp) : NULL;
+    gboolean savable = (mime != NULL && (g_str_has_prefix(mime, "image/")
+                            || g_ascii_strcasecmp(mime, "application/pdf") == 0))
+        || uri_is_pdf(uri);
+    if (!savable)
+        return FALSE;
+
+    g_object_unref(webkit_web_view_download_uri(view, uri)); /* session keeps it alive */
+    return TRUE;
+}
+
 /* ----------------------------------------------------------------- keys */
 static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval,
     guint keycode, GdkModifierType state, gpointer user_data)
@@ -1309,6 +1389,14 @@ static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval
             return TRUE;
         }
         return FALSE; /* let the entries handle typing; skip global shortcuts */
+    }
+
+    /* Ctrl+S: save a standalone image/PDF tab straight to Downloads. On any other
+     * page fall through (return FALSE) so the site's own Ctrl+S handler still sees
+     * it — e.g. a web app's "save document". */
+    if ((state & CTRL) && (keyval == GDK_KEY_s || keyval == GDK_KEY_S)) {
+        WebKitWebView* v = current_view();
+        return v != NULL && save_current_media(v);
     }
 
     for (size_t i = 0; i < sizeof(shortcut) / sizeof(shortcut[0]); i++) {
