@@ -609,8 +609,8 @@ static gboolean on_decide_policy(WebKitWebView* view, WebKitPolicyDecision* deci
         WebKitResponsePolicyDecision* rpd = WEBKIT_RESPONSE_POLICY_DECISION(decision);
         /* application/pdf isn't reported as a "supported" MIME, but WebKit's bundled
          * PDF.js viewer (PDFJSViewer, on by default) renders it — so let it through
-         * and the PDF opens in the tab instead of downloading. Ctrl+S still saves it
-         * to Downloads (see save_current_media). */
+         * and the PDF opens in the tab instead of downloading. PDF.js binds Ctrl+S
+         * itself to save the file (through the normal download pipeline). */
         WebKitURIResponse* resp = webkit_response_policy_decision_get_response(rpd);
         const char* mime = resp ? webkit_uri_response_get_mime_type(resp) : NULL;
         if (mime != NULL && g_ascii_strcasecmp(mime, "application/pdf") == 0)
@@ -1304,44 +1304,6 @@ static void handle_shortcut(func id)
     }
 }
 
-/* TRUE if the URL's path ends in ".pdf" (case-insensitive), query string ignored.
- * The PDF.js viewer shows a PDF inside an HTML document, so the page's MIME type
- * alone wouldn't reveal it's a PDF — the URL does. */
-static gboolean uri_is_pdf(const char* uri)
-{
-    GUri* u = g_uri_parse(uri, G_URI_FLAGS_NONE, NULL);
-    if (u == NULL)
-        return FALSE;
-    const char* path = g_uri_get_path(u);
-    size_t len = path ? strlen(path) : 0;
-    gboolean pdf = len >= 4 && g_ascii_strcasecmp(path + len - 4, ".pdf") == 0;
-    g_uri_unref(u);
-    return pdf;
-}
-
-/* Ctrl+S handler for a standalone image or PDF tab: save it straight to
- * DOWNLOADS_DIR through the normal download pipeline (which auto-names and
- * uniquifies — see on_download_destination). Returns TRUE if it kicked off a save;
- * FALSE on any other page so the caller lets Ctrl+S pass through to the page. */
-static gboolean save_current_media(WebKitWebView* view)
-{
-    const char* uri = webkit_web_view_get_uri(view);
-    if (uri == NULL || uri[0] == '\0')
-        return FALSE;
-
-    WebKitWebResource* res = webkit_web_view_get_main_resource(view);
-    WebKitURIResponse* resp = res ? webkit_web_resource_get_response(res) : NULL;
-    const char* mime = resp ? webkit_uri_response_get_mime_type(resp) : NULL;
-    gboolean savable = (mime != NULL && (g_str_has_prefix(mime, "image/")
-                            || g_ascii_strcasecmp(mime, "application/pdf") == 0))
-        || uri_is_pdf(uri);
-    if (!savable)
-        return FALSE;
-
-    g_object_unref(webkit_web_view_download_uri(view, uri)); /* session keeps it alive */
-    return TRUE;
-}
-
 /* ----------------------------------------------------------------- keys */
 static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval,
     guint keycode, GdkModifierType state, gpointer user_data)
@@ -1389,14 +1351,6 @@ static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval
             return TRUE;
         }
         return FALSE; /* let the entries handle typing; skip global shortcuts */
-    }
-
-    /* Ctrl+S: save a standalone image/PDF tab straight to Downloads. On any other
-     * page fall through (return FALSE) so the site's own Ctrl+S handler still sees
-     * it — e.g. a web app's "save document". */
-    if ((state & CTRL) && (keyval == GDK_KEY_s || keyval == GDK_KEY_S)) {
-        WebKitWebView* v = current_view();
-        return v != NULL && save_current_media(v);
     }
 
     for (size_t i = 0; i < sizeof(shortcut) / sizeof(shortcut[0]); i++) {
