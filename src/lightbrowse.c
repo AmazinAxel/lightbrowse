@@ -487,34 +487,68 @@ static void sleep_tab(WebKitWebView* view)
         webkit_web_view_terminate_web_process(view);
 }
 
-/* Available system memory in MiB, or -1 if /proc/meminfo can't be read. */
-static long system_available_mb(void)
+/* Current memory-pressure reading: the PSI "some avg10" percentage — the share of
+ * the last 10s in which at least one task stalled waiting on memory. ~0 on a
+ * healthy machine (even one sitting at 100% RAM with free swap), climbing only
+ * under genuine thrash. Returns -1 if PSI isn't available (pre-4.20 kernel or
+ * CONFIG_PSI off), so the caller falls back to the absolute OOM floor. */
+static double system_mem_pressure(void)
+{
+    char* contents = NULL;
+    if (!g_file_get_contents("/proc/pressure/memory", &contents, NULL, NULL))
+        return -1;
+    double pressure = -1;
+    char* p = strstr(contents, "some avg10=");
+    if (p != NULL)
+        pressure = g_ascii_strtod(p + strlen("some avg10="), NULL);
+    g_free(contents);
+    return pressure;
+}
+
+/* Free RAM *plus* free swap in MiB (everywhere the kernel can still put a page),
+ * or -1 if /proc/meminfo can't be read. This is the true "about to OOM" gauge:
+ * unlike MemAvailable alone it doesn't false-alarm while swap has headroom. */
+static long system_oom_headroom_mb(void)
 {
     char* contents = NULL;
     if (!g_file_get_contents("/proc/meminfo", &contents, NULL, NULL))
         return -1;
-    long mb = -1;
-    char* p = strstr(contents, "MemAvailable:");
-    if (p != NULL)
-        mb = strtol(p + strlen("MemAvailable:"), NULL, 10) / 1024; /* the field is in kB */
+    long mb = 0;
+    gboolean got = FALSE;
+    const char* fields[] = { "MemAvailable:", "SwapFree:" };
+    for (int i = 0; i < 2; i++) {
+        char* p = strstr(contents, fields[i]);
+        if (p != NULL) {
+            mb += strtol(p + strlen(fields[i]), NULL, 10) / 1024; /* fields are in kB */
+            got = TRUE;
+        }
+    }
     g_free(contents);
-    return mb;
+    return got ? mb : -1;
 }
 
-/* The crash defense: every few seconds, check how much system RAM is free. While
- * there's plenty, leave every tab loaded. Under pressure, sleep the
- * least-recently-used background tab (one per sweep — it's self-correcting as the
- * OS reclaims memory). If memory is critically low, sleep every background tab at
- * once so the machine can't OOM out from under us. */
+/* The crash defense: every few seconds, gauge real memory pressure. While the
+ * machine is comfortable (low PSI, swap headroom) leave every tab loaded — a
+ * swap-backed laptop can sit near 100% RAM without trouble, so we don't reap
+ * tabs just because free RAM is low. Under genuine pressure, sleep the
+ * least-recently-used background tab (one per sweep — self-correcting as the OS
+ * reclaims memory), skipping any tab seen too recently so tab-switching stays
+ * snappy. If the machine is thrashing or has run clean out of RAM *and* swap,
+ * dump every background tab at once so it can't OOM out from under us. */
 static gboolean sleep_sweep(gpointer data)
 {
     if (notebook == NULL)
         return G_SOURCE_CONTINUE;
-    long avail = system_available_mb();
-    if (avail < 0 || avail >= TAB_SLEEP_LOW_MEM_MB)
-        return G_SOURCE_CONTINUE; /* can't tell, or plenty free: don't touch any tab */
-    gboolean critical = avail < TAB_SLEEP_CRITICAL_MEM_MB;
 
+    double pressure = system_mem_pressure();
+    long headroom = system_oom_headroom_mb();
+    gboolean oom_floor = headroom >= 0 && headroom < TAB_SLEEP_OOM_FLOOR_MB;
+
+    if (!oom_floor && (pressure < 0 || pressure < TAB_SLEEP_PRESSURE))
+        return G_SOURCE_CONTINUE; /* comfortable (or PSI unavailable and swap fine): leave tabs be */
+    gboolean critical = oom_floor || pressure >= TAB_SLEEP_PRESSURE_CRITICAL;
+
+    gint64 now = g_get_monotonic_time() / G_USEC_PER_SEC;
     GtkWidget* cur = gtk_notebook_get_nth_page(notebook, gtk_notebook_get_current_page(notebook));
     GtkWidget* lru = NULL;
     gint64 lru_time = G_MAXINT64;
@@ -528,6 +562,8 @@ static gboolean sleep_sweep(gpointer data)
             continue;
         }
         gint64 last = (gint64)GPOINTER_TO_SIZE(g_object_get_data(G_OBJECT(page), "last-active"));
+        if (now - last < TAB_SLEEP_MIN_AGE_SECONDS)
+            continue; /* just left this tab — keep it warm so switching back is instant */
         if (last < lru_time) {
             lru_time = last;
             lru = page;
@@ -1564,7 +1600,7 @@ static void ensure_window(void)
     gtk_widget_add_controller(GTK_WIDGET(window), keys);
 
     setup_theme();
-    /* Sleep idle tabs only when system RAM runs low (see sleep_sweep). */
+    /* Sleep idle tabs only under real memory pressure, not when RAM is merely full (see sleep_sweep). */
     g_timeout_add_seconds(TAB_SLEEP_SWEEP_SECONDS, sleep_sweep, NULL);
     /* No tab is created here: the caller paints the window/modal first, then warms
      * the web process on idle, so the search box appears without waiting on WebKit. */

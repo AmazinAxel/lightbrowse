@@ -5,12 +5,20 @@
 #define MAX_NUM_TABS 16 // 0 for inf tabs
 #define CLOSED_TAB_HISTORY 3 // how many closed tabs can be reopened (ctrl+shift+t)
 #define MRU_HISTORY 4 // how many tabs alt+tab walks back through (most-recently-used order)
-/* Tab sleeping is driven by *system* memory pressure, not a fixed timer: tabs only
- * sleep when the machine is actually low on RAM. A slept tab's web process is freed
- * (RAM reclaimed), its button dims to 50%, and reselecting it reloads the page. */
-#define TAB_SLEEP_LOW_MEM_MB 640      // below this much available system RAM, sleep the least-recently-used background tab
-#define TAB_SLEEP_CRITICAL_MEM_MB 320 // below this, sleep every background tab at once to head off an imminent system OOM
-#define TAB_SLEEP_SWEEP_SECONDS 8     // how often to check available memory
+/* Tab sleeping is driven by real memory *pressure*, not free-RAM headroom: a
+ * machine with plenty of swap is meant to sit near 100% RAM (the kernel uses it
+ * as cache), so "low on free RAM" is a false alarm there. Instead we watch the
+ * kernel's PSI stall metric (/proc/pressure/memory), which only climbs when tasks
+ * actually stall waiting on memory — i.e. genuine thrash / OOM risk — and is
+ * swap-aware by construction. A swap-backed laptop therefore browses at full
+ * speed and tabs sleep only when the machine is truly struggling. A slept tab's
+ * web process is freed (RAM reclaimed), its button dims to 50%, and reselecting
+ * it reloads the page. */
+#define TAB_SLEEP_PRESSURE 12.0       // %% of the last 10s spent stalled on memory (PSI "some avg10") above which we sleep the least-recently-used background tab
+#define TAB_SLEEP_PRESSURE_CRITICAL 35.0 // above this the machine is thrashing: sleep every background tab at once to head off an imminent OOM
+#define TAB_SLEEP_OOM_FLOOR_MB 256    // last-resort backstop: if free RAM *plus* free swap drops below this (nowhere left to put pages), dump every background tab regardless of PSI
+#define TAB_SLEEP_MIN_AGE_SECONDS 45  // never sleep a tab you were looking at more recently than this, even under pressure (keeps tab-switching snappy)
+#define TAB_SLEEP_SWEEP_SECONDS 8     // how often to check pressure
 #define FUZZY_RESULTS 3 // max bookmark suggestions shown in the search modal
 #define TAB_ICON_SIZE 24 // px, favicon size in the vertical tab strip
 #define SEARCH "https://bing.com/search?q=%s&form=QBRE" // form=QBRE = "typed in the search box", which Bing ranks better
