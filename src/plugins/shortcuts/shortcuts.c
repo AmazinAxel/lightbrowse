@@ -12,6 +12,7 @@ static const struct {
     { "gh ", "https://github.com/search?q=" },
     { "g ", "https://google.com/search?q=" },
     { "yt ", "https://youtube.com/search?q=" },
+    { "sk ", "https://skripthub.net/docs/?search=" },
 };
 
 char* shortcut_expand(const char* uri)
