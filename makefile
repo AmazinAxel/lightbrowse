@@ -15,7 +15,7 @@ SECURITY=-fstack-protector-strong
 SRC=src/lightbrowse.c
 DEPS=webkitgtk-6.0 gtk4
 INCS=`pkg-config --cflags $(DEPS)`
-LIBS=`pkg-config --libs $(DEPS)`
+LIBS=`pkg-config --libs $(DEPS)` -lm
 
 CONFIG=src/config.h
 

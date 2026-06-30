@@ -13,14 +13,20 @@ static const struct {
     { "g ", "https://google.com/search?q=" },
     { "yt ", "https://youtube.com/search?q=" },
     { "sk ", "https://skripthub.net/docs/?search=" },
+    { "wa ", "https://www.wolframalpha.com/input?i=" },
 };
 
 char* shortcut_expand(const char* uri)
 {
     for (size_t i = 0; i < G_N_ELEMENTS(shortcuts); i++) {
-        if (g_str_has_prefix(uri, shortcuts[i].prefix))
-            return g_strconcat(shortcuts[i].expansion,
-                uri + strlen(shortcuts[i].prefix), NULL);
+        if (g_str_has_prefix(uri, shortcuts[i].prefix)) {
+            /* URL-encode the query so '+', '&', spaces, etc. survive intact --
+             * Wolfram in particular needs '+' as %2B, not a space. */
+            char* q = g_uri_escape_string(uri + strlen(shortcuts[i].prefix), NULL, TRUE);
+            char* out = g_strconcat(shortcuts[i].expansion, q, NULL);
+            g_free(q);
+            return out;
+        }
     }
     return NULL;
 }

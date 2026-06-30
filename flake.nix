@@ -64,9 +64,11 @@
                 src/plugins/shortcuts/shortcuts.c \
                 src/plugins/readability/readability.c \
                 src/plugins/bookmarks/bookmarks.c \
+                src/plugins/calculator/tinyexpr.c \
+                src/plugins/calculator/calculator.c \
                 src/lightbrowse.c \
                 -o out/lightbrowse \
-                $(pkg-config --libs webkitgtk-6.0 gtk4)
+                $(pkg-config --libs webkitgtk-6.0 gtk4) -lm
 
               # Adblock web-process extension: a shared library WebKit loads
               # into the web process to block requests against the filter list.

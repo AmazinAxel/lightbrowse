@@ -28,6 +28,8 @@ static const char* CSS =
     ".modal entry selection { background: #81A1C1; color: #2E3440; }"
     ".modal label { padding: 8px; border: 1px solid #4C566A; background-color: #3B4252; border-radius: 6px; transition: all 120ms ease; }"
     ".modal .selected { background: #81A1C1; color: #ECEFF4; border-color: #D8DEE9; transform: translateY(-2px) scale(1.01); outline: 2px solid #81A1C1; outline-offset: 1px; }"
+    /* Calculator result: a plain label under the search box, not a result row. */
+    ".modal .calc { padding: 4px 0 0 4px; border: none; background: none; color: #5e81ac; font-weight: bold; font-size: 1.3rem; }"
 
     ".findbar { background: #2E3440; color: #ECEFF4; border: 1px solid #5e81ac; border-radius: 8px; padding: 4px; margin-bottom: 12px; outline: 2px solid #5E81AC; }"
     ".findbar entry { background: #3B4252; color: #ECEFF4; border: 1px solid #4C566A; caret-color: #ECEFF4; }"
@@ -68,6 +70,9 @@ static GtkLabel* modal_info;
 static GtkEntry* modal_entry1; /* search text / bookmark name */
 static GtkEntry* modal_entry2; /* bookmark url (hidden in search mode) */
 static GtkBox* modal_results;
+static GtkLabel* calc_label; /* search: live calculation result, shown under the entry */
+static gboolean calc_active = FALSE; /* a valid calculation is currently displayed */
+static char calc_result[64]; /* its formatted value, for the clipboard */
 static const char* fuzzy_urls[FUZZY_RESULTS];
 static guint fuzzy_count = 0;
 static int fuzzy_sel = -1;
@@ -134,8 +139,12 @@ static void load_uri(WebKitWebView* view, const char* uri)
         return;
     }
 
-    char* search = g_strdup_printf(SEARCH, uri);
+    /* Encode the query so special characters ('+', '&', '~', spaces, ...) reach
+     * the search engine intact instead of being mangled into URL syntax. */
+    char* q = g_uri_escape_string(uri, NULL, TRUE);
+    char* search = g_strdup_printf(SEARCH, q);
     webkit_web_view_load_uri(view, search);
+    g_free(q);
     g_free(search);
 }
 
@@ -182,6 +191,11 @@ static WebKitNetworkSession* get_shared_network_session(void)
         webkit_memory_pressure_settings_free(mp);
 
         session = webkit_network_session_new(DATA_DIR, DATA_DIR);
+        /* Disable ITP: its storage partitioning blocks the third-party
+         * challenges.cloudflare.com iframe from accessing storage until a user
+         * interaction is recorded for the domain, which made Cloudflare Turnstile
+         * fail on first appearance and only pass on the second attempt. */
+        webkit_network_session_set_itp_enabled(session, FALSE);
         WebKitCookieManager* cm = webkit_network_session_get_cookie_manager(session);
         webkit_cookie_manager_set_persistent_storage(cm, DATA_DIR "/cookies.sqlite", WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
         webkit_cookie_manager_set_accept_policy(cm, WEBKIT_COOKIE_POLICY_ACCEPT_ALWAYS);
@@ -917,13 +931,22 @@ static gboolean session_restore(void)
 }
 
 /* ----------------------------------------------------------------- modal */
-/* modal_results shares a box with modal_entry1 (entry first, then the bookmark
- * rows) so the box's spacing only appears when rows exist. Clear the rows only. */
+/* modal_results holds modal_entry1, then the persistent calc_label, then the
+ * bookmark rows -- so the box's spacing only grows when rows exist. Clear the
+ * bookmark rows only, keeping the entry and calc_label in place. */
 static void clear_results(void)
 {
     GtkWidget* c;
-    while ((c = gtk_widget_get_last_child(GTK_WIDGET(modal_results))) != GTK_WIDGET(modal_entry1))
+    while ((c = gtk_widget_get_last_child(GTK_WIDGET(modal_results))) != GTK_WIDGET(calc_label))
         gtk_box_remove(modal_results, c);
+}
+
+/* Hide the live calculation result and forget its value. */
+static void calc_clear(void)
+{
+    calc_active = FALSE;
+    calc_result[0] = '\0';
+    gtk_widget_set_visible(GTK_WIDGET(calc_label), FALSE);
 }
 
 static void modal_hide(void)
@@ -933,6 +956,7 @@ static void modal_hide(void)
     gtk_widget_set_visible(modal_box, FALSE);
     gtk_entry_set_attributes(modal_entry1, NULL);
     clear_results();
+    calc_clear();
     fuzzy_count = 0;
     fuzzy_sel = -1;
 }
@@ -945,6 +969,7 @@ static void modal_show(ModalMode mode, gboolean open_new_tab)
     fuzzy_count = 0;
     fuzzy_sel = -1;
     clear_results();
+    calc_clear();
     gtk_entry_set_attributes(modal_entry1, NULL);
     gtk_widget_set_visible(GTK_WIDGET(modal_entry1), TRUE);
     gtk_widget_set_visible(GTK_WIDGET(modal_results), TRUE);
@@ -971,11 +996,14 @@ static void modal_show(ModalMode mode, gboolean open_new_tab)
 static void modal_restyle_results(void)
 {
     int i = 0;
-    for (GtkWidget* c = gtk_widget_get_next_sibling(GTK_WIDGET(modal_entry1)); c != NULL; c = gtk_widget_get_next_sibling(c), i++) {
+    for (GtkWidget* c = gtk_widget_get_next_sibling(GTK_WIDGET(modal_entry1)); c != NULL; c = gtk_widget_get_next_sibling(c)) {
+        if (c == GTK_WIDGET(calc_label))
+            continue; /* the calc result is a label, not a selectable row */
         if (i == fuzzy_sel)
             gtk_widget_add_css_class(c, "selected");
         else
             gtk_widget_remove_css_class(c, "selected");
+        i++;
     }
 }
 
@@ -1035,6 +1063,19 @@ static void on_search_changed(GtkEditable* editable, gpointer data)
     clear_results();
     fuzzy_count = 0;
     fuzzy_sel = -1;
+
+    /* Live calculator: show the result under the box when the text is a valid
+     * expression (a cheap synchronous parse -- no blocking). Skip when a
+     * shortcut leader is active, since that's a search, not a sum. */
+    calc_clear();
+    if (ll == 0 && calc_eval(text, calc_result, sizeof calc_result)) {
+        char* shown = g_strconcat("= ", calc_result, NULL);
+        gtk_label_set_text(calc_label, shown);
+        g_free(shown);
+        gtk_widget_set_visible(GTK_WIDGET(calc_label), TRUE);
+        calc_active = TRUE;
+    }
+
     if (ll == 0)
         prefetch_host(text); /* warm DNS for a directly-typed host */
     if (ll == 0 && strlen(text) >= 2) {
@@ -1065,12 +1106,17 @@ static void on_modal_activate(GtkEntry* entry, gpointer data)
         return;
     }
     if (modal_mode == MODAL_SEARCH) {
-        const char* uri;
-        if (fuzzy_sel >= 0)
-            uri = fuzzy_urls[fuzzy_sel];
-        else
-            uri = gtk_editable_get_text(GTK_EDITABLE(modal_entry1));
-        modal_open_search_uri(uri);
+        if (fuzzy_sel >= 0) {
+            modal_open_search_uri(fuzzy_urls[fuzzy_sel]);
+            return;
+        }
+        /* No bookmark picked but a calculation is showing: copy the value. */
+        if (calc_active) {
+            gdk_clipboard_set_text(gtk_widget_get_clipboard(GTK_WIDGET(modal_entry1)), calc_result);
+            modal_hide();
+            return;
+        }
+        modal_open_search_uri(gtk_editable_get_text(GTK_EDITABLE(modal_entry1)));
         return;
     }
     /* MODAL_BOOKMARK */
@@ -1364,11 +1410,21 @@ static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval
 
     if (modal_mode != MODAL_NONE) {
         if (modal_mode == MODAL_SEARCH) {
-            /* Shift+Enter jumps straight to the top fuzzy bookmark match,
-             * skipping the typed-text search. No-op when nothing matched. */
+            /* Shift+Enter sends a live calculation to Wolfram|Alpha (as if the
+             * user typed "wa <expr>"); otherwise it jumps straight to the top
+             * fuzzy bookmark match, skipping the typed-text search. */
             if ((state & SFT) && (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter)) {
-                if (fuzzy_count > 0)
+                if (calc_active) {
+                    char* tmp = g_strconcat("wa ", gtk_editable_get_text(GTK_EDITABLE(modal_entry1)), NULL);
+                    char* url = shortcut_expand(tmp);
+                    g_free(tmp);
+                    if (url != NULL) {
+                        modal_open_search_uri(url);
+                        g_free(url);
+                    }
+                } else if (fuzzy_count > 0) {
                     modal_open_search_uri(fuzzy_urls[0]);
+                }
                 return TRUE;
             }
             if (keyval == GDK_KEY_Down) {
@@ -1471,6 +1527,13 @@ static void build_modal(void)
      * between present children — no dangling space under the entry when empty. */
     modal_results = GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL, 4));
     gtk_box_append(modal_results, GTK_WIDGET(modal_entry1));
+    /* Persistent calc-result label, pinned right under the entry and above any
+     * bookmark rows. Hidden until the typed text is a valid expression. */
+    calc_label = GTK_LABEL(gtk_label_new(""));
+    gtk_widget_add_css_class(GTK_WIDGET(calc_label), "calc");
+    gtk_label_set_xalign(calc_label, 0.0);
+    gtk_widget_set_visible(GTK_WIDGET(calc_label), FALSE);
+    gtk_box_append(modal_results, GTK_WIDGET(calc_label));
 
     gtk_box_append(GTK_BOX(modal_box), GTK_WIDGET(modal_info));
     gtk_box_append(GTK_BOX(modal_box), GTK_WIDGET(modal_results));
