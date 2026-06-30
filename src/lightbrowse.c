@@ -703,9 +703,14 @@ static const char* DEFAULT_TEXT_CSS = "html { color: #ECEFF4; }";
  * left untouched by remove_all_style_sheets. */
 static void view_set_dark_chrome(WebKitWebView* view, gboolean dark)
 {
+    /* Background stays dark for every load, even after a real page commits: a real
+     * site paints its own opaque background over this canvas, so the dark only ever
+     * shows in the pre-paint gap (and in overscroll). Flipping to white at COMMITTED
+     * used to expose that gap as a white flash before the page's first frame. The
+     * `dark` flag now only gates the white-text helper, which the transparent
+     * about:/error pages need but a real site (black-on-white default) must not get. */
     GdkRGBA dark_c = { 0.180, 0.204, 0.251, 1.0 }; /* Nord polar night #2E3440 */
-    GdkRGBA light_c = { 1.0, 1.0, 1.0, 1.0 };      /* plain UA white */
-    webkit_web_view_set_background_color(view, dark ? &dark_c : &light_c);
+    webkit_web_view_set_background_color(view, &dark_c);
 
     WebKitUserContentManager* ucm = webkit_web_view_get_user_content_manager(view);
     webkit_user_content_manager_remove_all_style_sheets(ucm);
