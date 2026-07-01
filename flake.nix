@@ -7,21 +7,85 @@
       forAllSystems = f:
         nixpkgs.lib.genAttrs systems
           (system: f system nixpkgs.legacyPackages.${system});
+
+      # Version of bnema/ublock-webkit-filters we build the converter from.
+      # Baked into the shipped `version` marker: bumping it makes the browser
+      # recompile the content-blocker JSON exactly once (see content_filters.c).
+      converterVersion = "v2026.06.30";
+
+      # The converter turns EasyList/uBO lists into WebKit content-blocker JSON
+      # (network blocks + cosmetic hiding). Built from source so we can feed it our
+      # own list set (adblock/filter_lists.toml — adds cookie/annoyance lists).
+      converterFor = pkgs: pkgs.buildGoModule {
+        pname = "ublock-webkit-filters";
+        version = converterVersion;
+        src = pkgs.fetchFromGitHub {
+          owner = "bnema";
+          repo = "ublock-webkit-filters";
+          rev = converterVersion;
+          # nix build --impure once with lib.fakeHash, then paste the reported hash.
+          hash = "sha256-/V/auyEcfiCYvxNrY64yTR4lUesbcc4JG8XUhPF1PWk=";
+        };
+        # buildGoModule needs the vendored-deps hash; same fill-in-from-error dance.
+        vendorHash = "sha256-I3Dnf6EADqyYTDlk881xIIPGZbxvkbBxO1l+U1Cbbgg=";
+        subPackages = [ "cmd/ublock-webkit-filters" ];
+      };
     in {
       packages = forAllSystems (system: pkgs:
         let
-          # NEEDS IMPURITY TO BUILD LISTS (use --impure)
-          fetch = url: builtins.fetchurl url;
+          lib = pkgs.lib;
+          ublockConverter = converterFor pkgs;
 
-          filterSources = [
-            # EasyList family (uBlock lists were dropped: compiling a regex per
-            # rule at web-process startup blocked the first page load)
-            (fetch "https://easylist.to/easylist/easylist.txt")
-            (fetch "https://easylist.to/easylist/easyprivacy.txt")
-          ];
-          # combined lists
-          filterList = pkgs.runCommand "lightbrowse-filterlist.txt" { } ''
-            cat ${nixpkgs.lib.concatStringsSep " " filterSources} > $out
+          # Single source of truth for which lists we ship: parse the same TOML the
+          # dev `make adblock` target uses.
+          adblockConfig = builtins.fromTOML (builtins.readFile ./adblock/filter_lists.toml);
+          enabledLists = builtins.filter (l: l.enabled) adblockConfig.lists;
+          # Fetch each list impurely (NEEDS --impure; no hash, like the old flake).
+          # The converter only speaks HTTP, and the build sandbox has no outbound
+          # network — so we serve the fetched files back over loopback (which the
+          # sandbox does provide) and point the converter at localhost.
+          # Explicit name: some list URLs carry query strings that aren't valid
+          # store-path names (e.g. Peter Lowe's serverlist.php?...).
+          fetchedLists = map
+            (l: l // { path = builtins.fetchurl { inherit (l) url name; }; })
+            enabledLists;
+          adblockPort = "8765";
+          localToml = pkgs.writeText "filter_lists_local.toml" ''
+            [http]
+            timeout = "30s"
+            retries = 3
+            [output]
+            max_rules_per_file = ${toString adblockConfig.output.max_rules_per_file}
+            generate_combined = true
+            generate_manifest = true
+            ${lib.concatMapStringsSep "\n" (l: ''
+              [[lists]]
+              name = "${l.name}"
+              url = "http://127.0.0.1:${adblockPort}/${l.name}"
+              enabled = true
+            '') fetchedLists}
+          '';
+
+          adblockFilters = pkgs.runCommand "lightbrowse-adblock-filters"
+            { nativeBuildInputs = [ ublockConverter pkgs.python3 ]; } ''
+            mkdir -p docroot "$out"
+            ${lib.concatMapStringsSep "\n"
+              (l: "cp ${l.path} docroot/${l.name}") fetchedLists}
+
+            python3 -m http.server ${adblockPort} --directory docroot &
+            server=$!
+            trap "kill $server 2>/dev/null" EXIT
+            # Wait for the loopback server to accept connections before converting.
+            for _ in $(seq 1 50); do
+              if python3 -c 'import socket,sys; sys.exit(0 if socket.socket().connect_ex(("127.0.0.1",${adblockPort}))==0 else 1)'; then
+                break
+              fi
+              sleep 0.1
+            done
+
+            ublock-webkit-filters convert -c ${localToml} --output "$out"
+            # Version marker the browser reads to key WebKit's compiled-filter cache.
+            printf '%s' "${converterVersion}" > "$out/version"
           '';
 
           gstPlugins = with pkgs.gst_all_1; [
@@ -56,7 +120,7 @@
               mkdir -p out
 
               # Main browser binary. LIGHTBROWSE_SHARE_DIR is baked in so the
-              # binary finds readability.js + the adblock extension dir in the
+              # binary finds readability.js + the adblock filter JSON in the
               # store at runtime.
               gcc -std=c23 -O2 -flto -Wall -Wextra -Wno-unused-parameter -fstack-protector-strong \
                 -DLIGHTBROWSE_SHARE_DIR="\"$out/share/lightbrowse\"" \
@@ -66,20 +130,10 @@
                 src/plugins/bookmarks/bookmarks.c \
                 src/plugins/calculator/tinyexpr.c \
                 src/plugins/calculator/calculator.c \
+                src/plugins/adblock/content_filters.c \
                 src/lightbrowse.c \
                 -o out/lightbrowse \
                 $(pkg-config --libs webkitgtk-6.0 gtk4) -lm
-
-              # Adblock web-process extension: a shared library WebKit loads
-              # into the web process to block requests against the filter list.
-              # The filter list path is compiled in via -D.
-              gcc -std=c23 -O2 -flto -Wall -Wextra -Wno-unused-parameter -fPIC -shared \
-                $(pkg-config --cflags webkitgtk-web-process-extension-6.0 glib-2.0 gio-2.0) \
-                -DADBLOCK_FILTERLIST_PATH="\"$out/share/lightbrowse/filterlist.txt\"" \
-                src/plugins/adblock/adblock_extension.c \
-                src/plugins/adblock/uri_tester.c \
-                -o out/liblightbrowse-adblock.so \
-                $(pkg-config --libs webkitgtk-web-process-extension-6.0 glib-2.0 gio-2.0)
 
               runHook postBuild
             '';
@@ -90,10 +144,13 @@
               install -Dm644 src/plugins/readability/readability.js \
                 $out/share/lightbrowse/readability.js
 
-              # Adblock extension + combined filter list
-              install -Dm755 out/liblightbrowse-adblock.so \
-                $out/share/lightbrowse/extensions/liblightbrowse-adblock.so
-              install -Dm644 ${filterList} $out/share/lightbrowse/filterlist.txt
+              # WebKit content-blocker JSON (+ version marker) the browser compiles
+              # and attaches at runtime via WebKitUserContentFilterStore.
+              install -d $out/share/lightbrowse/adblock
+              install -Dm644 ${adblockFilters}/combined-part*.json \
+                -t $out/share/lightbrowse/adblock
+              install -Dm644 ${adblockFilters}/version \
+                $out/share/lightbrowse/adblock/version
 
               # Desktop entry: required so the system can route http(s) links to
               install -d $out/share/applications
@@ -117,6 +174,9 @@
 
       devShells = forAllSystems (system: pkgs:
         let
+          # Same converter the package builds, exposed in the dev shell so `make
+          # adblock` can regenerate the content-blocker JSON locally.
+          ublockConverter = converterFor pkgs;
           gstPlugins = with pkgs.gst_all_1; [
             gstreamer
             gst-plugins-base
@@ -127,13 +187,13 @@
           ];
         in {
           default = pkgs.mkShell {
-            nativeBuildInputs = with pkgs; [
+            nativeBuildInputs = (with pkgs; [
               pkg-config
               wrapGAppsHook4
               gcc
               gnumake
               clang-tools # make format
-            ];
+            ]) ++ [ ublockConverter ]; # `make adblock` regenerates the filter JSON
 
             buildInputs = (with pkgs; [
               glib

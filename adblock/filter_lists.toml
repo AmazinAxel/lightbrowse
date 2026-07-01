@@ -1,0 +1,76 @@
+# Filter-list set for lightbrowse's ad blocking.
+#
+# Consumed by the `ublock-webkit-filters` converter (built from source in
+# flake.nix), which fetches these lists and converts every rule it can express
+# into WebKit content-blocker JSON (network blocks + cosmetic css-display-none).
+# Rules it can't faithfully represent (scriptlets, procedural cosmetics, CSP,
+# redirects) are skipped rather than broadened. The output combined-part*.json
+# files are loaded at runtime via WebKitUserContentFilterStore.
+#
+# Pass explicitly with `-c adblock/filter_lists.toml`.
+
+[http]
+timeout = "30s"
+retries = 3
+
+[output]
+max_rules_per_file = 150000
+generate_combined = true
+generate_manifest = true
+
+# --- Ads + tracking (the bulk of network blocking) ---------------------------
+
+[[lists]]
+name = "easylist"
+url = "https://easylist.to/easylist/easylist.txt"
+enabled = true
+
+[[lists]]
+name = "easyprivacy"
+url = "https://easylist.to/easylist/easyprivacy.txt"
+enabled = true
+
+[[lists]]
+name = "ublock-filters"
+url = "https://ublockorigin.github.io/uAssets/filters/filters.txt"
+enabled = true
+
+[[lists]]
+name = "ublock-privacy"
+url = "https://ublockorigin.github.io/uAssets/filters/privacy.txt"
+enabled = true
+
+[[lists]]
+name = "ublock-badware"
+url = "https://ublockorigin.github.io/uAssets/filters/badware.txt"
+enabled = true
+
+# Unbreak restores sites that over-broad rules break; keep it enabled.
+[[lists]]
+name = "ublock-unbreak"
+url = "https://ublockorigin.github.io/uAssets/filters/unbreak.txt"
+enabled = true
+
+[[lists]]
+name = "ublock-quick-fixes"
+url = "https://ublockorigin.github.io/uAssets/filters/quick-fixes.txt"
+enabled = true
+
+[[lists]]
+name = "peter-lowe"
+url = "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=adblockplus&mimetype=plaintext"
+enabled = true
+
+# --- Annoyances + cookie banners (enabled here; off in the upstream default) --
+# These are largely cosmetic (css-display-none), so they hide consent banners and
+# other nags rather than block requests.
+
+[[lists]]
+name = "ublock-annoyances"
+url = "https://ublockorigin.github.io/uAssets/filters/annoyances.txt"
+enabled = true
+
+[[lists]]
+name = "easylist-cookies"
+url = "https://secure.fanboy.co.nz/fanboy-cookiemonster_ubo.txt"
+enabled = true

@@ -40,8 +40,14 @@
 #endif
 
 /* Plugins */
-#define ADBLOCK_EXTENSIONS_DIR LIGHTBROWSE_SHARE_DIR "/extensions"
-#define ADBLOCK_FILTERLIST_PATH LIGHTBROWSE_SHARE_DIR "/filterlist.txt"
+#define ADBLOCK_ENABLED 1
+/* WebKit content-blocker JSON (combined-part*.json + a `version` marker),
+ * generated at build time from EasyList/uBO lists by the ublock-webkit-filters
+ * converter. */
+#define ADBLOCK_FILTERS_DIR LIGHTBROWSE_SHARE_DIR "/adblock"
+/* Writable cache for WebKit's compiled (serialized) filters, keyed off the
+ * shipped list version so an update recompiles once then reloads from cache. */
+#define ADBLOCK_STORE_DIR DATA_DIR "/adblock-store"
 
 #define WEBKIT_DEFAULT_SETTINGS \
     "enable-developer-extras", true, \

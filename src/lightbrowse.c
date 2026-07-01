@@ -157,12 +157,8 @@ static WebKitWebContext* get_shared_web_context(void)
         /* Most aggressive caching: "improve document load speed substantially by
          * caching a very large number of resources and previously viewed content." */
         webkit_web_context_set_cache_model(context, WEBKIT_CACHE_MODEL_WEB_BROWSER);
-        webkit_web_context_set_web_process_extensions_directory(context, ADBLOCK_EXTENSIONS_DIR);
-        GVariantBuilder builder;
-        g_variant_builder_init(&builder, G_VARIANT_TYPE_VARDICT);
-        g_variant_builder_add(&builder, "{sv}", "enabled", g_variant_new_boolean(TRUE));
-        webkit_web_context_set_web_process_extensions_initialization_user_data(
-            context, g_variant_builder_end(&builder));
+        /* Ad blocking is no longer a web-process extension: it runs as native
+         * WebKit content filters attached per view (see adblock_apply_to_view). */
     }
     return context;
 }
@@ -782,6 +778,10 @@ static WebKitWebView* append_tab(WebKitWebView* related)
         WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
     webkit_user_content_manager_add_script(ucm, script);
     webkit_user_script_unref(script);
+
+    /* Attach native ad-block content filters to this tab (adds any that are already
+     * compiled, and back-fills the rest as compilation finishes). */
+    adblock_apply_to_view(view);
 
     /* The selection + (dark-only) default-text stylesheets are installed by
      * view_set_dark_chrome (called above), which re-runs them on every load. */
@@ -1668,6 +1668,11 @@ static void ensure_window(void)
     gtk_widget_add_controller(GTK_WIDGET(window), keys);
 
     setup_theme();
+#if ADBLOCK_ENABLED
+    /* Start compiling the ad-block content filters now so they're ready by (or
+     * shortly after) the first navigation. Idempotent — safe on re-activation. */
+    adblock_content_init(ADBLOCK_FILTERS_DIR, ADBLOCK_STORE_DIR);
+#endif
     /* Sleep idle tabs only under real memory pressure, not when RAM is merely full (see sleep_sweep). */
     g_timeout_add_seconds(TAB_SLEEP_SWEEP_SECONDS, sleep_sweep, NULL);
     /* No tab is created here: the caller paints the window/modal first, then warms
