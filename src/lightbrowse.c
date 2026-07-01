@@ -1388,6 +1388,20 @@ static void handle_shortcut(func id)
                 }
             }
             break;
+        case translate_page: {
+            /* Replace the current tab with Google Translate's whole-page proxy
+             * of the current URL (auto source -> English). */
+            const char* uri = view ? webkit_web_view_get_uri(view) : NULL;
+            if (uri != NULL && (g_str_has_prefix(uri, "http://") || g_str_has_prefix(uri, "https://"))) {
+                char* enc = g_uri_escape_string(uri, NULL, TRUE);
+                char* translated = g_strdup_printf(
+                    "https://translate.google.com/translate?sl=auto&tl=en&u=%s", enc);
+                webkit_web_view_load_uri(view, translated);
+                g_free(enc);
+                g_free(translated);
+            }
+            break;
+        }
     }
 }
 
