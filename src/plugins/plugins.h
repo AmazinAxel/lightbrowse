@@ -3,3 +3,4 @@
 #include "bookmarks/bookmarks.h"
 #include "calculator/calculator.h"
 #include "adblock/content_filters.h"
+#include "passwords/passwords.h"

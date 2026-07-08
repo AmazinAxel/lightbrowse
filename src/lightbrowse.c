@@ -59,8 +59,8 @@ static int mru_len = 0;
 static int alt_walk = -1;            /* index into mru during a walk; -1 when idle */
 static gboolean alt_switch = FALSE;  /* TRUE while the walk drives the page switch itself */
 
-/* Modal (search / bookmark) */
-typedef enum { MODAL_NONE, MODAL_SEARCH, MODAL_BOOKMARK } ModalMode;
+/* Modal (search / bookmark / password picker) */
+typedef enum { MODAL_NONE, MODAL_SEARCH, MODAL_BOOKMARK, MODAL_PASSWORD, MODAL_PERMISSION } ModalMode;
 static ModalMode modal_mode = MODAL_NONE;
 static gboolean modal_new_tab = FALSE; /* search: open in a new tab vs current */
 static gboolean modal_blocked = FALSE; /* tab limit reached: don't open on submit */
@@ -76,6 +76,25 @@ static char calc_result[64]; /* its formatted value, for the clipboard */
 static const char* fuzzy_urls[FUZZY_RESULTS];
 static guint fuzzy_count = 0;
 static int fuzzy_sel = -1;
+
+/* Password picker (MODAL_PASSWORD): pass_entries mirrors fuzzy_urls but holds
+ * `pass` entry paths; pass_host is the current page's host we match against;
+ * pass_target is the view to inject the filled credentials into. */
+static const char* pass_entries[FUZZY_RESULTS];
+static char pass_host[256];
+static WebKitWebView* pass_target = NULL;
+
+/* Permission prompts (camera/microphone getUserMedia + Storage Access API).
+ * WebKitGTK denies every permission request unless the app allows it explicitly,
+ * so without this a page (Zoom, Meet, ...) silently gets no mic/camera and its
+ * whole call collapses. Each request is shown in the shared modal (Enter allows,
+ * Esc denies); a grant is remembered for the browser session only (perm_allowed,
+ * an in-memory set gone on quit) so repeating it within the session doesn't
+ * re-prompt. Requests are keyed by host (media) or requesting|current domain
+ * (storage) in "perm-key"; a NULL key is never remembered. */
+static WebKitPermissionRequest* perm_current = NULL; /* request awaiting a decision, or NULL */
+static GQueue perm_queue = G_QUEUE_INIT;             /* further requests, shown one at a time */
+static GHashTable* perm_allowed = NULL;              /* set of perm-keys granted this session */
 
 /* Find bar */
 static GtkWidget* findbar;
@@ -112,20 +131,110 @@ static void on_download_started(WebKitNetworkSession* session, WebKitDownload* d
 static void mru_promote(GtkWidget* page);
 static void mru_remove(GtkWidget* page);
 static void tab_set_asleep(WebKitWebView* view, gboolean asleep);
+static void modal_show_permission(const char* markup);
+static void modal_hide(void);
 
 /* ---------------------------------------------------------------- URI load */
+/* Does `s` carry an explicit URI scheme we should navigate to as-is? Accepts a
+ * valid RFC-3986 scheme ("[a-z][a-z0-9+.-]*:") in two forms: "scheme://…" (any
+ * scheme, so custom app URLs like myapp:// navigate — the decide-policy handler
+ * then hands non-web ones to the OS), and "scheme:rest" without a slash for the
+ * schemeless-authority schemes (about:, data:, mailto:, tel:, …). A bare
+ * "host:1234" would look like "scheme:digits", so an all-digit remainder is
+ * treated as a host:port, not a scheme. */
+static bool has_uri_scheme(const char* s)
+{
+    if (!g_ascii_isalpha((guchar)s[0]))
+        return false;
+    const char* p = s + 1;
+    while (g_ascii_isalnum((guchar)*p) || *p == '+' || *p == '-' || *p == '.')
+        p++;
+    if (*p != ':')
+        return false;
+    if (p[1] == '/' && p[2] == '/')
+        return true;
+    if (p[1] == '\0')
+        return false;
+    for (const char* d = p + 1; *d != '\0'; d++)
+        if (!g_ascii_isdigit((guchar)*d))
+            return true; /* non-digit remainder -> a real scheme (mailto:, data:, …) */
+    return false; /* all digits -> host:port, not a scheme */
+}
+
+/* Does `s` look like a bare hostname the user meant to visit (vs. a search)?
+ * True when it has no whitespace and its authority is a plausible host: an
+ * alphabetic TLD of 2+ chars (.com .dev .net .local .io …), a dotted-quad /
+ * bracketed-IPv6 literal, or exactly "localhost" — with an optional :port. This
+ * replaces the old hardcoded ".com"/".org" check with a general heuristic. */
+static bool looks_like_host(const char* s)
+{
+    for (const char* p = s; *p != '\0'; p++)
+        if (g_ascii_isspace((guchar)*p))
+            return false;
+
+    gsize alen = strcspn(s, "/?#"); /* the authority, before any path/query/fragment */
+    if (alen == 0)
+        return false;
+    char* auth = g_strndup(s, alen);
+    char* at = strrchr(auth, '@');
+    char* host = at ? at + 1 : auth; /* drop any userinfo */
+
+    bool ok = false;
+    if (host[0] == '[') {
+        ok = strchr(host, ']') != NULL; /* bracketed IPv6 literal */
+    } else {
+        char* colon = strrchr(host, ':'); /* strip an all-digit :port */
+        if (colon != NULL && colon[1] != '\0') {
+            bool digits = true;
+            for (char* d = colon + 1; *d != '\0'; d++)
+                if (!g_ascii_isdigit((guchar)*d)) {
+                    digits = false;
+                    break;
+                }
+            if (digits)
+                *colon = '\0';
+        }
+        if (g_ascii_strcasecmp(host, "localhost") == 0) {
+            ok = true;
+        } else {
+            char* dot = strrchr(host, '.');
+            if (dot != NULL && dot != host && dot[1] != '\0') {
+                int tldlen = 0;
+                bool tld_alpha = true;
+                for (char* d = dot + 1; *d != '\0'; d++, tldlen++)
+                    if (!g_ascii_isalpha((guchar)*d)) {
+                        tld_alpha = false;
+                        break;
+                    }
+                if (tld_alpha && tldlen >= 2) {
+                    ok = true;
+                } else { /* not an alpha TLD -> only accept an IPv4-ish dotted number */
+                    bool ipish = true;
+                    for (char* d = host; *d != '\0'; d++)
+                        if (!g_ascii_isdigit((guchar)*d) && *d != '.') {
+                            ipish = false;
+                            break;
+                        }
+                    ok = ipish;
+                }
+            }
+        }
+    }
+    g_free(auth);
+    return ok;
+}
+
 static void load_uri(WebKitWebView* view, const char* uri)
 {
     if (uri[0] == '\0')
         return;
 
-    bool direct = g_str_has_prefix(uri, "http://") || g_str_has_prefix(uri, "https://") || g_str_has_prefix(uri, "file://") || g_str_has_prefix(uri, "about:") || g_str_has_prefix(uri, "data:");
-    if (direct) {
+    if (has_uri_scheme(uri)) {
         webkit_web_view_load_uri(view, uri);
         return;
     }
 
-    if (strstr(uri, ".com") || strstr(uri, ".org")) {
+    if (looks_like_host(uri)) {
         char* tmp = g_strconcat("https://", uri, NULL);
         webkit_web_view_load_uri(view, tmp);
         g_free(tmp);
@@ -672,6 +781,27 @@ static gboolean on_decide_policy(WebKitWebView* view, WebKitPolicyDecision* deci
         return FALSE;
     WebKitNavigationAction* a = webkit_navigation_policy_decision_get_navigation_action(
         WEBKIT_NAVIGATION_POLICY_DECISION(decision));
+
+    /* A navigation to a scheme WebKit can't load itself (an app callback like
+     * myapp://, or mailto:/tel:) would otherwise error. Hand it to the OS's
+     * registered handler instead and drop the in-page navigation. */
+    const char* nav_uri = webkit_uri_request_get_uri(webkit_navigation_action_get_request(a));
+    const char* scheme = nav_uri ? g_uri_peek_scheme(nav_uri) : NULL;
+    static const char* web_schemes[] = { "http", "https", "file", "about", "data", "blob", "ws", "wss" };
+    if (scheme != NULL) {
+        bool web = false;
+        for (size_t i = 0; i < G_N_ELEMENTS(web_schemes); i++)
+            if (g_ascii_strcasecmp(scheme, web_schemes[i]) == 0) {
+                web = true;
+                break;
+            }
+        if (!web) {
+            g_app_info_launch_default_for_uri(nav_uri, NULL, NULL);
+            webkit_policy_decision_ignore(decision);
+            return TRUE;
+        }
+    }
+
     if (webkit_navigation_action_get_mouse_button(a) != 2) /* 2 = middle */
         return FALSE;
     notebook_create_new_tab(webkit_uri_request_get_uri(webkit_navigation_action_get_request(a)));
@@ -722,6 +852,129 @@ static void view_set_dark_chrome(WebKitWebView* view, gboolean dark)
     }
 }
 
+/* ------------------------------------------------ camera/mic permissions */
+/* The host of the view's current page (for the prompt text + session memory), or
+ * NULL for a page without one (about:, file:, ...). Caller frees. */
+static char* view_host(WebKitWebView* view)
+{
+    const char* uri = view ? webkit_web_view_get_uri(view) : NULL;
+    if (uri == NULL)
+        return NULL;
+    GUri* u = g_uri_parse(uri, G_URI_FLAGS_NONE, NULL);
+    if (u == NULL)
+        return NULL;
+    const char* host = g_uri_get_host(u);
+    char* out = (host != NULL && host[0] != '\0') ? g_strdup(host) : NULL;
+    g_uri_unref(u);
+    return out;
+}
+
+/* Pop and display the next queued permission request in the shared modal, or hide
+ * the modal once the queue is drained. */
+static void perm_show_next(void)
+{
+    if (perm_current != NULL)
+        return; /* one decision at a time */
+    perm_current = g_queue_pop_head(&perm_queue);
+    if (perm_current == NULL) {
+        modal_hide();
+        return;
+    }
+    const char* msg = g_object_get_data(G_OBJECT(perm_current), "perm-msg");
+    modal_show_permission(msg ? msg : "This site wants access");
+}
+
+/* Resolve the shown request (Enter=allow, Esc=deny), remember an allow for its key
+ * this session, then show any request that queued up behind it. */
+static void perm_decide(gboolean allow)
+{
+    if (perm_current == NULL)
+        return;
+    if (allow) {
+        webkit_permission_request_allow(perm_current);
+        const char* key = g_object_get_data(G_OBJECT(perm_current), "perm-key");
+        if (key != NULL && key[0] != '\0')
+            g_hash_table_add(perm_allowed, g_strdup(key));
+    } else {
+        webkit_permission_request_deny(perm_current);
+    }
+    g_clear_object(&perm_current);
+    perm_show_next(); /* re-shows the modal for the next request, or hides it */
+}
+
+/* Build the prompt for a request, or return FALSE to leave it at WebKit's default.
+ * On TRUE, *key is the session-memory key (caller owns; NULL = never remember) and
+ * *msg is the Pango markup to show (caller owns). */
+static gboolean perm_describe(WebKitWebView* view, WebKitPermissionRequest* request,
+    char** key, char** msg)
+{
+    const char* hint = "\n<span size='small' foreground='#81A1C1'>"
+                       "Enter to allow · Esc to deny</span>";
+    if (WEBKIT_IS_USER_MEDIA_PERMISSION_REQUEST(request)) {
+        WebKitUserMediaPermissionRequest* um = WEBKIT_USER_MEDIA_PERMISSION_REQUEST(request);
+        gboolean audio = webkit_user_media_permission_is_for_audio_device(um);
+        gboolean video = webkit_user_media_permission_is_for_video_device(um);
+        const char* kind = (audio && video) ? "microphone &amp; camera"
+            : video                         ? "camera"
+                                            : "microphone";
+        char* host = view_host(view);
+        char* who = g_markup_escape_text(host != NULL ? host : "This site", -1);
+        *key = host; /* takes host (NULL for about:/file: — those aren't remembered) */
+        *msg = g_strdup_printf("<b>%s</b> wants %s access%s", who, kind, hint);
+        g_free(who);
+        return TRUE;
+    }
+    if (WEBKIT_IS_WEBSITE_DATA_ACCESS_PERMISSION_REQUEST(request)) {
+        WebKitWebsiteDataAccessPermissionRequest* wr
+            = WEBKIT_WEBSITE_DATA_ACCESS_PERMISSION_REQUEST(request);
+        const char* req = webkit_website_data_access_permission_request_get_requesting_domain(wr);
+        const char* cur = webkit_website_data_access_permission_request_get_current_domain(wr);
+        char* ereq = g_markup_escape_text(req ? req : "A site", -1);
+        char* ecur = g_markup_escape_text(cur ? cur : "this site", -1);
+        *key = g_strdup_printf("storage\n%s\n%s", req ? req : "", cur ? cur : "");
+        *msg = g_strdup_printf("<b>%s</b> wants to use its cookies on <b>%s</b>%s", ereq, ecur, hint);
+        g_free(ereq);
+        g_free(ecur);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean on_permission_request(WebKitWebView* view,
+    WebKitPermissionRequest* request, gpointer data G_GNUC_UNUSED)
+{
+    /* Device enumeration (the mic/camera picker Zoom shows) is benign and needed
+     * for the media UI once capture is in play; allow it silently. */
+    if (WEBKIT_IS_DEVICE_INFO_PERMISSION_REQUEST(request)) {
+        webkit_permission_request_allow(request);
+        return TRUE;
+    }
+
+    char* key = NULL;
+    char* msg = NULL;
+    /* Anything we don't describe keeps WebKit's safe default (denied). */
+    if (!perm_describe(view, request, &key, &msg))
+        return FALSE;
+
+    if (perm_allowed == NULL)
+        perm_allowed = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+
+    /* Already granted this session: allow without re-prompting. */
+    if (key != NULL && g_hash_table_contains(perm_allowed, key)) {
+        webkit_permission_request_allow(request);
+        g_free(key);
+        g_free(msg);
+        return TRUE;
+    }
+
+    g_object_set_data_full(G_OBJECT(request), "perm-key", key, g_free); /* may be NULL */
+    g_object_set_data_full(G_OBJECT(request), "perm-msg", msg, g_free);
+
+    g_queue_push_tail(&perm_queue, g_object_ref(request));
+    perm_show_next();
+    return TRUE; /* handled asynchronously: we hold a ref until perm_decide */
+}
+
 /* When `related` is non-NULL the new view is a popup (window.open / target=_blank):
  * constructing it with "related-view" keeps it in the opener's web process and
  * session and, crucially, preserves window.opener. Microsoft Rewards card
@@ -764,6 +1017,7 @@ static WebKitWebView* append_tab(WebKitWebView* related)
     g_signal_connect(view, "web-process-terminated", G_CALLBACK(on_web_process_terminated), NULL);
     g_signal_connect(view, "load-failed", G_CALLBACK(on_load_failed), NULL);
     g_signal_connect(view, "decide-policy", G_CALLBACK(on_decide_policy), NULL);
+    g_signal_connect(view, "permission-request", G_CALLBACK(on_permission_request), NULL);
     g_signal_connect(view, "notify::favicon", G_CALLBACK(on_favicon_notify), NULL);
     g_signal_connect(webkit_web_view_get_find_controller(view), "counted-matches", G_CALLBACK(on_counted_matches), NULL);
 
@@ -980,7 +1234,7 @@ static void modal_show(ModalMode mode, gboolean open_new_tab)
     gtk_widget_set_visible(GTK_WIDGET(modal_results), TRUE);
     gtk_widget_set_visible(GTK_WIDGET(modal_info), FALSE); /* only shown for "Tab limit reached" */
 
-    if (mode == MODAL_SEARCH) {
+    if (mode == MODAL_SEARCH || mode == MODAL_PASSWORD) {
         gtk_widget_set_visible(GTK_WIDGET(modal_entry2), FALSE);
         gtk_editable_set_text(GTK_EDITABLE(modal_entry1), "");
     } else { /* MODAL_BOOKMARK */
@@ -996,6 +1250,31 @@ static void modal_show(ModalMode mode, gboolean open_new_tab)
     gtk_widget_set_visible(modal_box, TRUE);
     gtk_widget_grab_focus(GTK_WIDGET(modal_entry1));
     gtk_editable_select_region(GTK_EDITABLE(modal_entry1), 0, -1);
+}
+
+/* Show a confirm-only prompt (no entry, no results) in the shared modal for a
+ * permission request: `markup` is the Pango text, Enter allows / Esc denies
+ * (handled in handle_signal_keypress). Reuses the search/bookmark dim + box. */
+static void modal_show_permission(const char* markup)
+{
+    modal_mode = MODAL_PERMISSION;
+    modal_blocked = FALSE;
+    fuzzy_count = 0;
+    fuzzy_sel = -1;
+    clear_results();
+    calc_clear();
+    gtk_entry_set_attributes(modal_entry1, NULL);
+    gtk_widget_set_visible(GTK_WIDGET(modal_entry1), FALSE);
+    gtk_widget_set_visible(GTK_WIDGET(modal_entry2), FALSE);
+    gtk_widget_set_visible(GTK_WIDGET(modal_results), FALSE);
+
+    gtk_label_set_markup(modal_info, markup);
+    gtk_label_set_justify(modal_info, GTK_JUSTIFY_CENTER);
+    gtk_widget_set_halign(GTK_WIDGET(modal_info), GTK_ALIGN_CENTER);
+    gtk_widget_set_visible(GTK_WIDGET(modal_info), TRUE);
+
+    gtk_widget_set_visible(dim, TRUE);
+    gtk_widget_set_visible(modal_box, TRUE);
 }
 
 static void modal_restyle_results(void)
@@ -1042,8 +1321,25 @@ static void prefetch_host(const char* text)
     g_free(host);
 }
 
+/* Rebuild the password picker's result rows for the current host + typed filter. */
+static void password_refresh_rows(const char* query)
+{
+    clear_results();
+    fuzzy_sel = -1;
+    fuzzy_count = passwords_match(pass_host, query, pass_entries, FUZZY_RESULTS);
+    for (guint i = 0; i < fuzzy_count; i++) {
+        GtkWidget* row = gtk_label_new(pass_entries[i]);
+        gtk_label_set_xalign(GTK_LABEL(row), 0.0);
+        gtk_box_append(modal_results, row);
+    }
+}
+
 static void on_search_changed(GtkEditable* editable, gpointer data)
 {
+    if (modal_mode == MODAL_PASSWORD) {
+        password_refresh_rows(gtk_editable_get_text(editable));
+        return;
+    }
     if (modal_mode != MODAL_SEARCH)
         return;
     const char* text = gtk_editable_get_text(editable);
@@ -1104,10 +1400,75 @@ static void modal_open_search_uri(const char* uri)
     modal_hide();
 }
 
+/* JS injected into the page to fill a login form. `username`/`password` arrive
+ * as function arguments (never interpolated into the source) so the secret stays
+ * out of the code string and escaping can't break. Values are written through the
+ * native value setter + input/change events so framework-controlled inputs (React,
+ * Vue, ...) pick them up. The form is NOT submitted -- the user presses Enter. */
+static const char* PASSWORD_FILL_JS =
+    "const vis = el => el && el.offsetParent !== null && !el.disabled && !el.readOnly;\n"
+    "const pw = Array.from(document.querySelectorAll('input[type=password]')).find(vis)\n"
+    "        || document.querySelector('input[type=password]');\n"
+    "if (!pw) return false;\n"
+    "const setVal = (el, val) => {\n"
+    "  const d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value')\n"
+    "         || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');\n"
+    "  (d && d.set ? d.set.bind(el) : (v => { el.value = v; }))(val);\n"
+    "  el.dispatchEvent(new Event('input', { bubbles: true }));\n"
+    "  el.dispatchEvent(new Event('change', { bubbles: true }));\n"
+    "};\n"
+    "if (username) {\n"
+    "  let userEl = null;\n"
+    "  const all = Array.from(document.querySelectorAll('input'));\n"
+    "  for (let i = all.indexOf(pw) - 1; i >= 0; i--) {\n"
+    "    const t = (all[i].type || '').toLowerCase();\n"
+    "    if (t === 'text' || t === 'email' || t === 'tel'\n"
+    "        || (all[i].autocomplete || '').includes('username')) { userEl = all[i]; break; }\n"
+    "  }\n"
+    "  if (!userEl) userEl = document.querySelector(\n"
+    "    'input[autocomplete~=username], input[type=email], input[name*=user i], input[id*=user i]');\n"
+    "  if (userEl) setVal(userEl, username);\n"
+    "}\n"
+    "setVal(pw, password);\n"
+    "pw.focus();\n"
+    "return true;\n";
+
+/* passwords_show_async callback: got the decrypted credentials, now fill the form. */
+static void on_password_ready(const char* username, const char* password, gpointer data)
+{
+    WebKitWebView* view = data;
+    if (view == NULL || !WEBKIT_IS_WEB_VIEW(view) || password == NULL)
+        return;
+
+    GVariantBuilder b;
+    g_variant_builder_init(&b, G_VARIANT_TYPE("a{sv}"));
+    g_variant_builder_add(&b, "{sv}", "username", g_variant_new_string(username ? username : ""));
+    g_variant_builder_add(&b, "{sv}", "password", g_variant_new_string(password));
+    GVariant* args = g_variant_ref_sink(g_variant_builder_end(&b));
+
+    webkit_web_view_call_async_javascript_function(view, PASSWORD_FILL_JS, -1,
+        args, NULL, NULL, NULL, NULL, NULL);
+    g_variant_unref(args);
+}
+
 static void on_modal_activate(GtkEntry* entry, gpointer data)
 {
     if (modal_blocked) {
         modal_hide();
+        return;
+    }
+    if (modal_mode == MODAL_PASSWORD) {
+        /* Enter fills the highlighted entry, or the top match if none is picked. */
+        int sel = fuzzy_sel >= 0 ? fuzzy_sel : (fuzzy_count > 0 ? 0 : -1);
+        if (sel >= 0) {
+            WebKitWebView* target = pass_target;
+            char* sel_entry = g_strdup(pass_entries[sel]);
+            modal_hide();
+            passwords_show_async(sel_entry, on_password_ready, target);
+            g_free(sel_entry);
+        } else {
+            modal_hide();
+        }
         return;
     }
     if (modal_mode == MODAL_SEARCH) {
@@ -1402,6 +1763,26 @@ static void handle_shortcut(func id)
             }
             break;
         }
+        case fill_password: {
+            /* Open the password picker for the current page's host. */
+            if (view == NULL)
+                break;
+            pass_host[0] = '\0';
+            const char* uri = webkit_web_view_get_uri(view);
+            if (uri != NULL) {
+                GUri* u = g_uri_parse(uri, G_URI_FLAGS_NONE, NULL);
+                if (u != NULL) {
+                    const char* host = g_uri_get_host(u);
+                    if (host != NULL)
+                        g_strlcpy(pass_host, host, sizeof pass_host);
+                    g_uri_unref(u);
+                }
+            }
+            pass_target = view;
+            modal_show(MODAL_PASSWORD, FALSE);
+            password_refresh_rows("");
+            break;
+        }
     }
 }
 
@@ -1409,6 +1790,17 @@ static void handle_shortcut(func id)
 static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval,
     guint keycode, GdkModifierType state, gpointer user_data)
 {
+    /* A pending permission prompt (mic/camera or storage access) owns the keyboard
+     * until it's answered: Enter allows, Esc denies, and every other key is swallowed
+     * so nothing acts on the page (or closes the tab) out from under the request. */
+    if (perm_current != NULL) {
+        if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter)
+            perm_decide(TRUE);
+        else if (keyval == GDK_KEY_Escape)
+            perm_decide(FALSE);
+        return TRUE;
+    }
+
     if (keyval == GDK_KEY_Escape) {
         if (modal_mode != MODAL_NONE) {
             modal_hide();
@@ -1428,6 +1820,16 @@ static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval
     }
 
     if (modal_mode != MODAL_NONE) {
+        if (modal_mode == MODAL_SEARCH || modal_mode == MODAL_PASSWORD) {
+            if (keyval == GDK_KEY_Down) {
+                modal_move_sel(1);
+                return TRUE;
+            }
+            if (keyval == GDK_KEY_Up) {
+                modal_move_sel(-1);
+                return TRUE;
+            }
+        }
         if (modal_mode == MODAL_SEARCH) {
             /* Shift+Enter sends a live calculation to Wolfram|Alpha (as if the
              * user typed "wa <expr>"); otherwise it jumps straight to the top
@@ -1444,14 +1846,6 @@ static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval
                 } else if (fuzzy_count > 0) {
                     modal_open_search_uri(fuzzy_urls[0]);
                 }
-                return TRUE;
-            }
-            if (keyval == GDK_KEY_Down) {
-                modal_move_sel(1);
-                return TRUE;
-            }
-            if (keyval == GDK_KEY_Up) {
-                modal_move_sel(-1);
                 return TRUE;
             }
         } else if (keyval == GDK_KEY_Tab) {

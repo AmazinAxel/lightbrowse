@@ -103,7 +103,9 @@ typedef enum {
 
     reading_mode,
 
-    translate_page
+    translate_page,
+
+    fill_password
 } func;
 
 static struct {
@@ -140,6 +142,7 @@ static struct {
     { CTRL,        KEY(x),             toggle_tabs          },
     { CTRL,        KEY(g),             translate_page       },
     { CTRL,        KEY(e),             view_source          },
+    { CTRL,        KEY(l),             fill_password        },
 
     { CTRL,        KEY(P),             print_page           },
 };

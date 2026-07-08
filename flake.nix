@@ -91,10 +91,12 @@
           gstPlugins = with pkgs.gst_all_1; [
             gstreamer
             gst-plugins-base
-            gst-plugins-good
+            gst-plugins-good # v4l2 device provider (USB/UVC webcams)
             gst-plugins-bad
             gst-plugins-ugly
             gst-libav
+            gst-plugin-pipewire # PipeWire camera/mic device provider — without it WebKit
+                                # enumerates 0 capture devices on PipeWire-routed systems
           ];
 
           buildInputs = (with pkgs; [
@@ -131,6 +133,7 @@
                 src/plugins/calculator/tinyexpr.c \
                 src/plugins/calculator/calculator.c \
                 src/plugins/adblock/content_filters.c \
+                src/plugins/passwords/passwords.c \
                 src/lightbrowse.c \
                 -o out/lightbrowse \
                 $(pkg-config --libs webkitgtk-6.0 gtk4) -lm
@@ -180,10 +183,12 @@
           gstPlugins = with pkgs.gst_all_1; [
             gstreamer
             gst-plugins-base
-            gst-plugins-good
+            gst-plugins-good # v4l2 device provider (USB/UVC webcams)
             gst-plugins-bad
             gst-plugins-ugly
             gst-libav
+            gst-plugin-pipewire # PipeWire camera/mic device provider — without it WebKit
+                                # enumerates 0 capture devices on PipeWire-routed systems
           ];
         in {
           default = pkgs.mkShell {
