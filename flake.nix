@@ -91,13 +91,17 @@
           gstPlugins = with pkgs.gst_all_1; [
             gstreamer
             gst-plugins-base
-            gst-plugins-good # v4l2 device provider (USB/UVC webcams)
+            gst-plugins-good
             gst-plugins-bad
             gst-plugins-ugly
             gst-libav
-            gst-plugin-pipewire # PipeWire camera/mic device provider — without it WebKit
-                                # enumerates 0 capture devices on PipeWire-routed systems
           ];
+          # PipeWire ships a GStreamer plugin (pipewiredeviceprovider) that WebKit's
+          # capture process needs to enumerate the camera/mic on a PipeWire-routed
+          # system — without it it sees 0 devices. It lives in pipewire's default
+          # output but, unlike gst_all_1.*, carries no setup hook to register itself
+          # on GST_PLUGIN_SYSTEM_PATH_1_0, so it's added to the wrapper by hand below.
+          pipewireGstPath = "${pkgs.pipewire}/lib/gstreamer-1.0";
 
           buildInputs = (with pkgs; [
             glib
@@ -116,6 +120,13 @@
             nativeBuildInputs = with pkgs; [ pkg-config wrapGAppsHook4 ];
 
             inherit buildInputs;
+
+            # wrapGAppsHook4 auto-adds the gst_all_1.* plugins (they set
+            # GST_PLUGIN_SYSTEM_PATH_1_0 via a setup hook) but not PipeWire's, so
+            # append it to the generated wrapper explicitly (see pipewireGstPath).
+            preFixup = ''
+              gappsWrapperArgs+=(--prefix GST_PLUGIN_SYSTEM_PATH_1_0 : "${pipewireGstPath}")
+            '';
 
             buildPhase = ''
               runHook preBuild
@@ -180,16 +191,17 @@
           # Same converter the package builds, exposed in the dev shell so `make
           # adblock` can regenerate the content-blocker JSON locally.
           ublockConverter = converterFor pkgs;
-          gstPlugins = with pkgs.gst_all_1; [
+          # Mirrors the package's runtime GStreamer plugins so `make run` has the same
+          # media stack. pkgs.pipewire supplies pipewiredeviceprovider (camera/mic
+          # enumeration); makeSearchPath in the shellHook adds each to GST_PLUGIN_SYSTEM_PATH_1_0.
+          gstPlugins = (with pkgs.gst_all_1; [
             gstreamer
             gst-plugins-base
-            gst-plugins-good # v4l2 device provider (USB/UVC webcams)
+            gst-plugins-good
             gst-plugins-bad
             gst-plugins-ugly
             gst-libav
-            gst-plugin-pipewire # PipeWire camera/mic device provider — without it WebKit
-                                # enumerates 0 capture devices on PipeWire-routed systems
-          ];
+          ]) ++ [ pkgs.pipewire ];
         in {
           default = pkgs.mkShell {
             nativeBuildInputs = (with pkgs; [

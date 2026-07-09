@@ -1233,6 +1233,7 @@ static void modal_show(ModalMode mode, gboolean open_new_tab)
     gtk_widget_set_visible(GTK_WIDGET(modal_entry1), TRUE);
     gtk_widget_set_visible(GTK_WIDGET(modal_results), TRUE);
     gtk_widget_set_visible(GTK_WIDGET(modal_info), FALSE); /* only shown for "Tab limit reached" */
+    gtk_widget_set_halign(GTK_WIDGET(modal_info), GTK_ALIGN_START); /* undo permission-prompt centering */
 
     if (mode == MODAL_SEARCH || mode == MODAL_PASSWORD) {
         gtk_widget_set_visible(GTK_WIDGET(modal_entry2), FALSE);
