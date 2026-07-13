@@ -285,22 +285,21 @@ static WebKitNetworkSession* get_shared_network_session(void)
          * tabs (100-400MB) stay well under these thresholds, so normal browsing
          * and repeat-visit speed are unaffected. */
         WebKitMemoryPressureSettings* mp = webkit_memory_pressure_settings_new();
-        webkit_memory_pressure_settings_set_memory_limit(mp, 2048);          /* MB per process */
+        webkit_memory_pressure_settings_set_memory_limit(mp, 2560);           /* MB per process */
         /* Set thresholds top-down (kill > strict > conservative): each setter asserts
          * its value sits below the *current* next-higher threshold, and the defaults
-         * (conservative 0.33, strict 0.5) would reject conservative=0.5 if set first. */
-        webkit_memory_pressure_settings_set_kill_threshold(mp, 0.95);        /* ~1.95GB: kill a runaway process */
-        webkit_memory_pressure_settings_set_strict_threshold(mp, 0.65);      /* >1.3GB: release aggressively */
-        webkit_memory_pressure_settings_set_conservative_threshold(mp, 0.5); /* >1.0GB: start releasing caches */
+         * (conservative 0.33, strict 0.5) would reject conservative=0.65 if set first.
+         * Thresholds sit high so heavy-but-honest pages keep their decoded-image and
+         * JIT caches (dropping those made repeat views slow); only a true runaway page
+         * crosses strict/kill. Sized for an 8GB machine: one process at the 2.5GB cap
+         * still leaves room, and the kill threshold fires before the system swaps. */
+        webkit_memory_pressure_settings_set_kill_threshold(mp, 0.95);         /* ~2.4GB: kill a runaway process */
+        webkit_memory_pressure_settings_set_strict_threshold(mp, 0.8);        /* >2.0GB: release aggressively */
+        webkit_memory_pressure_settings_set_conservative_threshold(mp, 0.65); /* >1.66GB: start releasing caches */
         webkit_network_session_set_memory_pressure_settings(mp);
         webkit_memory_pressure_settings_free(mp);
 
         session = webkit_network_session_new(DATA_DIR, DATA_DIR);
-        /* Disable ITP: its storage partitioning blocks the third-party
-         * challenges.cloudflare.com iframe from accessing storage until a user
-         * interaction is recorded for the domain, which made Cloudflare Turnstile
-         * fail on first appearance and only pass on the second attempt. */
-        webkit_network_session_set_itp_enabled(session, FALSE);
         WebKitCookieManager* cm = webkit_network_session_get_cookie_manager(session);
         webkit_cookie_manager_set_persistent_storage(cm, DATA_DIR "/cookies.sqlite", WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
         webkit_cookie_manager_set_accept_policy(cm, WEBKIT_COOKIE_POLICY_ACCEPT_ALWAYS);
@@ -476,20 +475,28 @@ static void on_load_progress(GObject* obj, GParamSpec* pspec, gpointer data)
 }
 
 static void view_set_dark_chrome(WebKitWebView* view, gboolean dark);
+static void view_probe_page_background(WebKitWebView* view);
 
 static void on_load_changed(WebKitWebView* view, WebKitLoadEvent event, gpointer data)
 {
     if (event == WEBKIT_LOAD_STARTED) {
         g_object_set_data(G_OBJECT(view), "load-error", NULL); /* assume this load is fine */
-        view_set_dark_chrome(view, TRUE);                      /* dark pre-paint loading flash */
+        /* Bump the load id so a background probe from the previous page can't flip
+         * the canvas white mid-load and reintroduce the white flash. */
+        g_object_set_data(G_OBJECT(view), "load-id",
+            GUINT_TO_POINTER(GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(view), "load-id")) + 1));
+        view_set_dark_chrome(view, TRUE); /* dark pre-paint loading flash */
     } else if (event == WEBKIT_LOAD_COMMITTED) {
         /* Keep dark chrome only where the page has no background of its own: the
          * (transparent) error page, and about: pages like the blank new tab. A real
-         * site has committed its document now, so hand it the plain white UA canvas. */
+         * site keeps the dark canvas for the pre-paint gap, then the probe below
+         * hands it the white UA canvas iff it paints no background of its own. */
         const char* uri = webkit_web_view_get_uri(view);
         gboolean dark = g_object_get_data(G_OBJECT(view), "load-error") != NULL
             || uri == NULL || g_str_has_prefix(uri, "about:");
         view_set_dark_chrome(view, dark);
+        if (!dark)
+            view_probe_page_background(view);
     }
 
     if (view != current_view())
@@ -516,11 +523,18 @@ static gboolean on_load_failed(WebKitWebView* view, WebKitLoadEvent event,
     return FALSE;
 }
 
+static void prefetch_host(const char* text);
+
 static void on_mouse_target(WebKitWebView* view, WebKitHitTestResult* hit, guint modifiers, gpointer data)
 {
-    status_set_link(view, webkit_hit_test_result_context_is_link(hit)
-            ? webkit_hit_test_result_get_link_uri(hit)
-            : NULL);
+    const char* uri = webkit_hit_test_result_context_is_link(hit)
+        ? webkit_hit_test_result_get_link_uri(hit)
+        : NULL;
+    /* Hover precedes click: warm DNS for the hovered link so the lookup is done
+     * (or in flight) by the time it's clicked. WebKit dedups repeat requests. */
+    if (uri != NULL)
+        prefetch_host(uri);
+    status_set_link(view, uri);
 }
 
 static void on_link_focus_message(WebKitUserContentManager* ucm, JSCValue* value, gpointer data)
@@ -787,7 +801,8 @@ static gboolean on_decide_policy(WebKitWebView* view, WebKitPolicyDecision* deci
      * registered handler instead and drop the in-page navigation. */
     const char* nav_uri = webkit_uri_request_get_uri(webkit_navigation_action_get_request(a));
     const char* scheme = nav_uri ? g_uri_peek_scheme(nav_uri) : NULL;
-    static const char* web_schemes[] = { "http", "https", "file", "about", "data", "blob", "ws", "wss" };
+    /* "webkit" covers internal pages like webkit://gpu (GPU diagnostics). */
+    static const char* web_schemes[] = { "http", "https", "file", "about", "data", "blob", "ws", "wss", "webkit" };
     if (scheme != NULL) {
         bool web = false;
         for (size_t i = 0; i < G_N_ELEMENTS(web_schemes); i++)
@@ -829,11 +844,12 @@ static const char* DEFAULT_TEXT_CSS = "html { color: #ECEFF4; }";
  * left untouched by remove_all_style_sheets. */
 static void view_set_dark_chrome(WebKitWebView* view, gboolean dark)
 {
-    /* Background stays dark for every load, even after a real page commits: a real
-     * site paints its own opaque background over this canvas, so the dark only ever
-     * shows in the pre-paint gap (and in overscroll). Flipping to white at COMMITTED
-     * used to expose that gap as a white flash before the page's first frame. The
-     * `dark` flag now only gates the white-text helper, which the transparent
+    /* Background is dark at the start of every load so the pre-paint gap (and a
+     * flip to white at COMMITTED, which lands before the page's first frame) never
+     * shows as a white flash. Sites that paint their own background cover it; sites
+     * that paint none would wrongly show through dark, so view_probe_page_background
+     * flips the canvas to the UA white for exactly those once their DOM is ready.
+     * The `dark` flag only gates the white-text helper, which the transparent
      * about:/error pages need but a real site (black-on-white default) must not get. */
     GdkRGBA dark_c = { 0.180, 0.204, 0.251, 1.0 }; /* Nord polar night #2E3440 */
     webkit_web_view_set_background_color(view, &dark_c);
@@ -850,6 +866,45 @@ static void view_set_dark_chrome(WebKitWebView* view, gboolean dark)
         webkit_user_content_manager_add_style_sheet(ucm, text);
         webkit_user_style_sheet_unref(text);
     }
+}
+
+/* Resolves (once the DOM is ready) to true iff neither <html> nor <body> paints a
+ * background, i.e. the page leans on the UA default white canvas. */
+static const char* BG_PROBE_JS =
+    "return new Promise(resolve => {\n"
+    "  const check = () => {\n"
+    "    const bare = el => { if (!el) return true; const s = getComputedStyle(el);\n"
+    "      return s.backgroundImage === 'none'\n"
+    "          && (s.backgroundColor === 'transparent' || s.backgroundColor === 'rgba(0, 0, 0, 0)'); };\n"
+    "    resolve(bare(document.documentElement) && bare(document.body));\n"
+    "  };\n"
+    "  if (document.readyState === 'loading')\n"
+    "    document.addEventListener('DOMContentLoaded', check, { once: true });\n"
+    "  else check();\n"
+    "});\n";
+
+static void on_bg_probe_done(GObject* src, GAsyncResult* res, gpointer data)
+{
+    WebKitWebView* view = WEBKIT_WEB_VIEW(src);
+    JSCValue* val = webkit_web_view_call_async_javascript_function_finish(view, res, NULL);
+    if (val == NULL)
+        return;
+    /* Only act if the probe belongs to the load still on screen. */
+    if (jsc_value_to_boolean(val)
+        && GPOINTER_TO_UINT(data) == GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(view), "load-id"))) {
+        GdkRGBA white = { 1.0, 1.0, 1.0, 1.0 };
+        webkit_web_view_set_background_color(view, &white);
+    }
+    g_object_unref(val);
+}
+
+/* A page that paints no background of its own expects the UA's white canvas, not
+ * our dark pre-paint one — detect that case and hand it the white canvas. */
+static void view_probe_page_background(WebKitWebView* view)
+{
+    gpointer load_id = g_object_get_data(G_OBJECT(view), "load-id");
+    webkit_web_view_call_async_javascript_function(view, BG_PROBE_JS, -1,
+        NULL, NULL, NULL, NULL, on_bg_probe_done, load_id);
 }
 
 /* ------------------------------------------------ camera/mic permissions */
@@ -1055,6 +1110,17 @@ static void notebook_create_new_tab(const char* uri)
     load_uri(view, uri ? uri : "about:blank"); /* about:blank spins up the web process */
 }
 
+/* Restore a tab without loading it: the tab appears dimmed with its URL remembered
+ * (the same "dead" state a slept tab uses), and revive_if_dead loads it on first
+ * switch. Startup then spawns one web process, not one per saved tab. */
+static void notebook_create_lazy_tab(const char* uri)
+{
+    WebKitWebView* view = append_tab(NULL);
+    g_object_set_data_full(G_OBJECT(view), "reload-uri", g_strdup(uri), g_free);
+    g_object_set_data(G_OBJECT(view), "dead", GINT_TO_POINTER(1));
+    tab_set_asleep(view, TRUE);
+}
+
 static GtkWidget* on_create_tab(WebKitWebView* self,
     WebKitNavigationAction* action G_GNUC_UNUSED, gpointer data G_GNUC_UNUSED)
 {
@@ -1182,10 +1248,12 @@ static gboolean session_restore(void)
     for (char** l = lines; *l != NULL; l++) {
         if ((*l)[0] == '\0')
             continue;
-        notebook_create_new_tab(*l);
+        notebook_create_lazy_tab(*l);
         any = TRUE;
     }
     g_strfreev(lines);
+    /* Every restored tab is lazy; wake only the one on screen (the last appended). */
+    revive_if_dead(current_view());
     return any;
 }
 
@@ -1405,12 +1473,14 @@ static void modal_open_search_uri(const char* uri)
  * as function arguments (never interpolated into the source) so the secret stays
  * out of the code string and escaping can't break. Values are written through the
  * native value setter + input/change events so framework-controlled inputs (React,
- * Vue, ...) pick them up. The form is NOT submitted -- the user presses Enter. */
+ * Vue, ...) pick them up. The form is NOT submitted -- the user presses Enter.
+ * Multi-step logins (email page first, password page later) have no password field
+ * yet: then only the username is filled; run the picker again on the next step. */
 static const char* PASSWORD_FILL_JS =
     "const vis = el => el && el.offsetParent !== null && !el.disabled && !el.readOnly;\n"
-    "const pw = Array.from(document.querySelectorAll('input[type=password]')).find(vis)\n"
-    "        || document.querySelector('input[type=password]');\n"
-    "if (!pw) return false;\n"
+    "const pick = sel => Array.from(document.querySelectorAll(sel)).find(vis)\n"
+    "               || document.querySelector(sel);\n"
+    "const pw = pick('input[type=password]');\n"
     "const setVal = (el, val) => {\n"
     "  const d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value')\n"
     "         || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');\n"
@@ -1418,20 +1488,25 @@ static const char* PASSWORD_FILL_JS =
     "  el.dispatchEvent(new Event('input', { bubbles: true }));\n"
     "  el.dispatchEvent(new Event('change', { bubbles: true }));\n"
     "};\n"
+    "let userEl = null;\n"
     "if (username) {\n"
-    "  let userEl = null;\n"
-    "  const all = Array.from(document.querySelectorAll('input'));\n"
-    "  for (let i = all.indexOf(pw) - 1; i >= 0; i--) {\n"
-    "    const t = (all[i].type || '').toLowerCase();\n"
-    "    if (t === 'text' || t === 'email' || t === 'tel'\n"
-    "        || (all[i].autocomplete || '').includes('username')) { userEl = all[i]; break; }\n"
+    "  if (pw) {\n"
+    "    const all = Array.from(document.querySelectorAll('input'));\n"
+    "    for (let i = all.indexOf(pw) - 1; i >= 0; i--) {\n"
+    "      const t = (all[i].type || '').toLowerCase();\n"
+    "      if (t === 'text' || t === 'email' || t === 'tel'\n"
+    "          || (all[i].autocomplete || '').includes('username')) { userEl = all[i]; break; }\n"
+    "    }\n"
     "  }\n"
-    "  if (!userEl) userEl = document.querySelector(\n"
-    "    'input[autocomplete~=username], input[type=email], input[name*=user i], input[id*=user i]');\n"
+    "  if (!userEl) userEl = pick(\n"
+    "    'input[autocomplete~=username], input[type=email], input[name*=user i],'\n"
+    "    + ' input[id*=user i], input[name*=email i], input[id*=email i],'\n"
+    "    + ' input[name*=login i], input[id*=login i]');\n"
     "  if (userEl) setVal(userEl, username);\n"
     "}\n"
-    "setVal(pw, password);\n"
-    "pw.focus();\n"
+    "if (!pw && !userEl) return false;\n"
+    "if (pw) { setVal(pw, password); pw.focus(); }\n"
+    "else userEl.focus();\n"
     "return true;\n";
 
 /* passwords_show_async callback: got the decrypted credentials, now fill the form. */
