@@ -218,12 +218,13 @@ static void on_show_done(GObject* src, GAsyncResult* res, gpointer data)
         g_strfreev(lines);
     }
 
-    /* Fallback: use the entry's trailing path component as the username, unless
-     * it looks like a bare domain (contains a dot). */
+    /* Fallback: use the entry's trailing path component as the username. Skip it
+     * when it looks like a bare domain (has a dot but no '@'); an email address
+     * also contains dots but is a perfectly good username, so keep those. */
     if (user == NULL && ctx->entry != NULL) {
         const char* slash = strrchr(ctx->entry, '/');
         const char* leaf = slash ? slash + 1 : ctx->entry;
-        if (strchr(leaf, '.') == NULL && leaf[0] != '\0')
+        if (leaf[0] != '\0' && (strchr(leaf, '@') != NULL || strchr(leaf, '.') == NULL))
             user = g_strdup(leaf);
     }
 
