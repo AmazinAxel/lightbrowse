@@ -1475,7 +1475,10 @@ static void modal_open_search_uri(const char* uri)
  * native value setter + input/change events so framework-controlled inputs (React,
  * Vue, ...) pick them up. The form is NOT submitted -- the user presses Enter.
  * Multi-step logins (email page first, password page later) have no password field
- * yet: then only the username is filled; run the picker again on the next step. */
+ * yet: then only the username is filled; run the picker again on the next step.
+ * A site's login field may be labelled "username" or "email" interchangeably for
+ * the same credential, so the username value is written into every visible field
+ * of either kind (plus the text/email/tel field just before the password). */
 static const char* PASSWORD_FILL_JS =
     "const vis = el => el && el.offsetParent !== null && !el.disabled && !el.readOnly;\n"
     "const pick = sel => Array.from(document.querySelectorAll(sel)).find(vis)\n"
@@ -1488,25 +1491,30 @@ static const char* PASSWORD_FILL_JS =
     "  el.dispatchEvent(new Event('input', { bubbles: true }));\n"
     "  el.dispatchEvent(new Event('change', { bubbles: true }));\n"
     "};\n"
-    "let userEl = null;\n"
+    "const userEls = [];\n"
     "if (username) {\n"
+    "  const add = el => { if (el && !userEls.includes(el)) userEls.push(el); };\n"
+    "  Array.from(document.querySelectorAll(\n"
+    "    'input[autocomplete~=username], input[type=email], input[name*=user i],'\n"
+    "    + ' input[id*=user i], input[name*=email i], input[id*=email i],'\n"
+    "    + ' input[name*=login i], input[id*=login i]')).filter(vis).forEach(add);\n"
     "  if (pw) {\n"
     "    const all = Array.from(document.querySelectorAll('input'));\n"
     "    for (let i = all.indexOf(pw) - 1; i >= 0; i--) {\n"
     "      const t = (all[i].type || '').toLowerCase();\n"
     "      if (t === 'text' || t === 'email' || t === 'tel'\n"
-    "          || (all[i].autocomplete || '').includes('username')) { userEl = all[i]; break; }\n"
+    "          || (all[i].autocomplete || '').includes('username')) { add(all[i]); break; }\n"
     "    }\n"
     "  }\n"
-    "  if (!userEl) userEl = pick(\n"
+    "  if (userEls.length === 0) { const el = pick(\n"
     "    'input[autocomplete~=username], input[type=email], input[name*=user i],'\n"
     "    + ' input[id*=user i], input[name*=email i], input[id*=email i],'\n"
-    "    + ' input[name*=login i], input[id*=login i]');\n"
-    "  if (userEl) setVal(userEl, username);\n"
+    "    + ' input[name*=login i], input[id*=login i]'); if (el) userEls.push(el); }\n"
+    "  userEls.forEach(el => setVal(el, username));\n"
     "}\n"
-    "if (!pw && !userEl) return false;\n"
+    "if (!pw && userEls.length === 0) return false;\n"
     "if (pw) { setVal(pw, password); pw.focus(); }\n"
-    "else userEl.focus();\n"
+    "else userEls[0].focus();\n"
     "return true;\n";
 
 /* passwords_show_async callback: got the decrypted credentials, now fill the form. */
