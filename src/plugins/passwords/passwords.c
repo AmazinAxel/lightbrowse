@@ -208,7 +208,10 @@ static void on_show_done(GObject* src, GAsyncResult* res, gpointer data)
             char* key = g_ascii_strdown(g_strndup(lines[i], colon - lines[i]), -1);
             char* k = g_strstrip(key);
             if (strcmp(k, "login") == 0 || strcmp(k, "user") == 0
-                || strcmp(k, "username") == 0 || strcmp(k, "email") == 0)
+                || strcmp(k, "username") == 0 || strcmp(k, "user_name") == 0
+                || strcmp(k, "email") == 0 || strcmp(k, "e-mail") == 0
+                || strcmp(k, "id") == 0 || strcmp(k, "identity") == 0
+                || strcmp(k, "account") == 0)
                 user = g_strdup(g_strstrip(colon + 1));
             g_free(key);
         }

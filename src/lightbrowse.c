@@ -1478,7 +1478,10 @@ static void modal_open_search_uri(const char* uri)
  * yet: then only the username is filled; run the picker again on the next step.
  * A site's login field may be labelled "username" or "email" interchangeably for
  * the same credential, so the username value is written into every visible field
- * of either kind (plus the text/email/tel field just before the password). */
+ * of either kind (plus the text/email/tel field just before the password). When
+ * nothing matches by attribute, we fall back passff-style to the first visible
+ * text/email/tel input (before the password, if any) so a plainly-named field
+ * still gets filled instead of being ignored. */
 static const char* PASSWORD_FILL_JS =
     "const vis = el => el && el.offsetParent !== null && !el.disabled && !el.readOnly;\n"
     "const pick = sel => Array.from(document.querySelectorAll(sel)).find(vis)\n"
@@ -1510,6 +1513,16 @@ static const char* PASSWORD_FILL_JS =
     "    'input[autocomplete~=username], input[type=email], input[name*=user i],'\n"
     "    + ' input[id*=user i], input[name*=email i], input[id*=email i],'\n"
     "    + ' input[name*=login i], input[id*=login i]'); if (el) userEls.push(el); }\n"
+    "  if (userEls.length === 0) {\n"
+    "    const texts = Array.from(document.querySelectorAll('input')).filter(el => {\n"
+    "      const t = (el.type || 'text').toLowerCase();\n"
+    "      return (t === 'text' || t === 'email' || t === 'tel') && vis(el);\n"
+    "    });\n"
+    "    const before = pw ? texts.filter(el =>\n"
+    "      el.compareDocumentPosition(pw) & Node.DOCUMENT_POSITION_FOLLOWING) : texts;\n"
+    "    const el = before[0] || texts[0];\n"
+    "    if (el) userEls.push(el);\n"
+    "  }\n"
     "  userEls.forEach(el => setVal(el, username));\n"
     "}\n"
     "if (!pw && userEls.length === 0) return false;\n"
