@@ -323,8 +323,14 @@ static WebKitNetworkSession* get_shared_network_session(void)
 static WebKitSettings* get_shared_settings(void)
 {
     static WebKitSettings* settings = NULL;
-    if (settings == NULL)
+    if (settings == NULL) {
         settings = webkit_settings_new_with_settings(WEBKIT_DEFAULT_SETTINGS, NULL);
+        /* Keep the GPU compositor always on rather than ramping it up on demand per
+         * page. Safe here: the target hardware has a working GPU (amdgpu); on a box
+         * with no GL this would force the slow software path, so it's deliberate. */
+        webkit_settings_set_hardware_acceleration_policy(settings,
+            WEBKIT_HARDWARE_ACCELERATION_POLICY_ALWAYS);
+    }
     return settings;
 }
 

@@ -56,6 +56,10 @@
     "enable-media-capabilities", true, \
     "enable-media-stream", true, \
     "enable-webrtc", true, \
+    /* Resolve hostnames for in-page links (and honour <link rel=dns-prefetch>) so a
+     * click's DNS lookup is already done -- complements the manual hover prefetch.
+     * Off by default in WebKitGTK. */ \
+    "enable-dns-prefetching", true, \
     "default-charset", "utf-8"
 
 #define KEY(x) GDK_KEY_##x
