@@ -55,6 +55,7 @@
     "enable-encrypted-media", true, \
     "enable-media-capabilities", true, \
     "enable-media-stream", true, \
+    "enable-webrtc", true, \
     "default-charset", "utf-8"
 
 #define KEY(x) GDK_KEY_##x

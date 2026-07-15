@@ -224,7 +224,7 @@ static bool looks_like_host(const char* s)
     return ok;
 }
 
-static void load_uri(WebKitWebView* view, const char* uri)
+static void load_uri_resolved(WebKitWebView* view, const char* uri)
 {
     if (uri[0] == '\0')
         return;
@@ -255,6 +255,16 @@ static void load_uri(WebKitWebView* view, const char* uri)
     webkit_web_view_load_uri(view, search);
     g_free(q);
     g_free(search);
+}
+
+/* Trim surrounding whitespace before resolving, so a pasted "  https://..." (or a
+ * value with a stray leading space / trailing newline) navigates straight to the
+ * URL instead of being rejected as a host and handed to the search engine. */
+static void load_uri(WebKitWebView* view, const char* uri)
+{
+    char* trimmed = g_strstrip(g_strdup(uri));
+    load_uri_resolved(view, trimmed);
+    g_free(trimmed);
 }
 
 /* ------------------------------------------------------------ shared state */
@@ -457,6 +467,19 @@ static void status_set_link(WebKitWebView* view, const char* uri)
  * which otherwise shows the faint, low-contrast default selection colour. */
 static const char* SELECTION_CSS =
     "::selection { background-color: #5E81AC !important; color: #FFFFFF !important; }";
+
+/* Our user agent claims macOS Safari (see webkit_settings_set_user_agent), and the
+ * whole navigator object already matches real Mac Safari -- except navigator.platform,
+ * which WebKit derives from the host OS and reports as "Linux x86_64". That single
+ * UA-vs-platform mismatch is a classic bot tell that trips Cloudflare's challenge on
+ * nearly every visit. Redefine platform to "MacIntel" at document-start (before any
+ * page script reads it) so the fingerprint is internally consistent. Injected into
+ * the page's main world so site scripts see the patched value. */
+static const char* NAVIGATOR_SPOOF_JS =
+    "try{Object.defineProperty(Navigator.prototype,'platform',"
+    "{get:function(){return 'MacIntel';},configurable:true});}"
+    "catch(e){try{Object.defineProperty(navigator,'platform',"
+    "{get:function(){return 'MacIntel';},configurable:true});}catch(e2){}}";
 
 /* Report the focused link (keyboard tabbing) the way hover reports it. */
 static const char* LINK_FOCUS_JS =
@@ -1088,6 +1111,12 @@ static WebKitWebView* append_tab(WebKitWebView* related)
     webkit_user_content_manager_add_script(ucm, script);
     webkit_user_script_unref(script);
 
+    /* Align navigator.platform with the macOS user agent (see NAVIGATOR_SPOOF_JS). */
+    WebKitUserScript* nav = webkit_user_script_new(NAVIGATOR_SPOOF_JS,
+        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
+    webkit_user_content_manager_add_script(ucm, nav);
+    webkit_user_script_unref(nav);
+
     /* Attach native ad-block content filters to this tab (adds any that are already
      * compiled, and back-fills the rest as compilation finishes). */
     adblock_apply_to_view(view);
@@ -1472,62 +1501,98 @@ static void modal_open_search_uri(const char* uri)
 /* JS injected into the page to fill a login form. `username`/`password` arrive
  * as function arguments (never interpolated into the source) so the secret stays
  * out of the code string and escaping can't break. Values are written through the
- * native value setter + input/change events so framework-controlled inputs (React,
- * Vue, ...) pick them up. The form is NOT submitted -- the user presses Enter.
- * Multi-step logins (email page first, password page later) have no password field
- * yet: then only the username is filled; run the picker again on the next step.
- * A site's login field may be labelled "username" or "email" interchangeably for
- * the same credential, so the username value is written into every visible field
- * of either kind (plus the text/email/tel field just before the password). When
- * nothing matches by attribute, we fall back passff-style to the first visible
- * text/email/tel input (before the password, if any) so a plainly-named field
- * still gets filled instead of being ignored. */
+ * native value setter + a full event burst so framework-controlled inputs (React,
+ * Vue, Angular, ...) pick them up. The form is NOT submitted -- the user presses
+ * Enter. Multi-step logins (email page first, password page later) have no password
+ * field yet: then only the username is filled; run the picker again on the next step.
+ *
+ * Field detection mirrors PassFF: every visible, writable input is *scored* against
+ * a keyword list by inspecting its id, name, autocomplete, placeholder and its
+ * <label>/aria-label text (not just id/name/autocomplete via CSS selectors, which
+ * misses fields that only announce themselves through a placeholder or label). id
+ * and name weigh 10x; an exact keyword match scores 2, a substring 1. The
+ * highest-scoring text/email/tel field is the username; the highest-scoring
+ * password field (native type=password always qualifies) is the password. When a
+ * password field exists we prefer a username field inside the same <form>, so a
+ * newsletter/search box elsewhere on the page can't steal the fill. If nothing
+ * scores, we fall back to the visible text/email/tel input just before the
+ * password (or the first one, on a password-less step). */
 static const char* PASSWORD_FILL_JS =
-    "const vis = el => el && el.offsetParent !== null && !el.disabled && !el.readOnly;\n"
-    "const pick = sel => Array.from(document.querySelectorAll(sel)).find(vis)\n"
-    "               || document.querySelector(sel);\n"
-    "const pw = pick('input[type=password]');\n"
+    "const loginNames = ['login','user','mail','email','tel','username',"
+    "'opt_login','log','usr_name'];\n"
+    "const pwNames = ['passwd','password','pass'];\n"
+    "const vis = el => el.offsetHeight !== 0 && el.offsetParent !== null"
+    " && !el.disabled && !el.readOnly;\n"
+    /* Gather every <input>, descending into open shadow roots (login widgets). */
+    "const collect = (root, out, seen) => {\n"
+    "  if (!root || seen.has(root)) return out; seen.add(root);\n"
+    "  let all; try { all = root.querySelectorAll('*'); } catch (e) { return out; }\n"
+    "  for (const el of all) {\n"
+    "    if (el.tagName === 'INPUT') out.push(el);\n"
+    "    if (el.shadowRoot) collect(el.shadowRoot, out, seen);\n"
+    "  }\n"
+    "  return out;\n"
+    "};\n"
+    "const labelText = el => {\n"
+    "  let t = el.getAttribute('aria-label') || '';\n"
+    "  if (el.labels) for (const l of el.labels) t += ' ' + (l.textContent || '');\n"
+    "  return t;\n"
+    "};\n"
+    "const rate = (el, names) => {\n"
+    "  const attrs = [el.id || '', el.name || '', el.autocomplete || '',"
+    " el.placeholder || '', labelText(el)];\n"
+    "  let score = 0;\n"
+    "  attrs.forEach((a, i) => {\n"
+    "    const v = a.toLowerCase(); const mult = i < 2 ? 10 : 1;\n"
+    "    for (const n of names) {\n"
+    "      if (v === n) score += 2 * mult; else if (v.includes(n)) score += mult;\n"
+    "    }\n"
+    "  });\n"
+    "  return score;\n"
+    "};\n"
     "const setVal = (el, val) => {\n"
+    "  el.focus();\n"
     "  const d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value')\n"
     "         || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');\n"
     "  (d && d.set ? d.set.bind(el) : (v => { el.value = v; }))(val);\n"
-    "  el.dispatchEvent(new Event('input', { bubbles: true }));\n"
-    "  el.dispatchEvent(new Event('change', { bubbles: true }));\n"
+    "  for (const t of ['keydown','keypress','keyup','input','change'])\n"
+    "    el.dispatchEvent(new Event(t, { bubbles: true }));\n"
     "};\n"
-    "const userEls = [];\n"
-    "if (username) {\n"
-    "  const add = el => { if (el && !userEls.includes(el)) userEls.push(el); };\n"
-    "  Array.from(document.querySelectorAll(\n"
-    "    'input[autocomplete~=username], input[type=email], input[name*=user i],'\n"
-    "    + ' input[id*=user i], input[name*=email i], input[id*=email i],'\n"
-    "    + ' input[name*=login i], input[id*=login i]')).filter(vis).forEach(add);\n"
-    "  if (pw) {\n"
-    "    const all = Array.from(document.querySelectorAll('input'));\n"
-    "    for (let i = all.indexOf(pw) - 1; i >= 0; i--) {\n"
-    "      const t = (all[i].type || '').toLowerCase();\n"
-    "      if (t === 'text' || t === 'email' || t === 'tel'\n"
-    "          || (all[i].autocomplete || '').includes('username')) { add(all[i]); break; }\n"
-    "    }\n"
+    "const inputs = collect(document, [], new Set()).filter(vis);\n"
+    "const isText = el => { const t = (el.type || 'text').toLowerCase();\n"
+    "  return t === 'text' || t === 'email' || t === 'tel'; };\n"
+    /* Best-scoring password field; a native type=password always qualifies. */
+    "let pw = null, pwScore = 0;\n"
+    "for (const el of inputs) {\n"
+    "  const t = (el.type || '').toLowerCase();\n"
+    "  if (t !== 'password' && t !== 'text') continue;\n"
+    "  let s = rate(el, pwNames); if (t === 'password' && s === 0) s = 19;\n"
+    "  if (s > pwScore) { pwScore = s; pw = el; }\n"
+    "}\n"
+    /* Best-scoring username field, preferring the password's own form. */
+    "const bestLogin = pool => {\n"
+    "  let best = null, bs = 0;\n"
+    "  for (const el of pool) {\n"
+    "    if (el === pw || !isText(el)) continue;\n"
+    "    const s = rate(el, loginNames);\n"
+    "    if (s > bs) { bs = s; best = el; }\n"
     "  }\n"
-    "  if (userEls.length === 0) { const el = pick(\n"
-    "    'input[autocomplete~=username], input[type=email], input[name*=user i],'\n"
-    "    + ' input[id*=user i], input[name*=email i], input[id*=email i],'\n"
-    "    + ' input[name*=login i], input[id*=login i]'); if (el) userEls.push(el); }\n"
-    "  if (userEls.length === 0) {\n"
-    "    const texts = Array.from(document.querySelectorAll('input')).filter(el => {\n"
-    "      const t = (el.type || 'text').toLowerCase();\n"
-    "      return (t === 'text' || t === 'email' || t === 'tel') && vis(el);\n"
-    "    });\n"
+    "  return best;\n"
+    "};\n"
+    "let login = null;\n"
+    "if (username) {\n"
+    "  if (pw && pw.form) login = bestLogin(inputs.filter(el => el.form === pw.form));\n"
+    "  if (!login) login = bestLogin(inputs);\n"
+    "  if (!login) {\n"
+    "    const texts = inputs.filter(el => el !== pw && isText(el));\n"
     "    const before = pw ? texts.filter(el =>\n"
     "      el.compareDocumentPosition(pw) & Node.DOCUMENT_POSITION_FOLLOWING) : texts;\n"
-    "    const el = before[0] || texts[0];\n"
-    "    if (el) userEls.push(el);\n"
+    "    login = before[before.length - 1] || before[0] || texts[0] || null;\n"
     "  }\n"
-    "  userEls.forEach(el => setVal(el, username));\n"
     "}\n"
-    "if (!pw && userEls.length === 0) return false;\n"
-    "if (pw) { setVal(pw, password); pw.focus(); }\n"
-    "else userEls[0].focus();\n"
+    "if (!pw && !login) return false;\n"
+    "if (login) setVal(login, username);\n"
+    "if (pw) { setVal(pw, password); pw.focus(); } else login.focus();\n"
     "return true;\n";
 
 /* passwords_show_async callback: got the decrypted credentials, now fill the form. */
@@ -1582,11 +1647,14 @@ static void on_modal_activate(GtkEntry* entry, gpointer data)
         modal_open_search_uri(gtk_editable_get_text(GTK_EDITABLE(modal_entry1)));
         return;
     }
-    /* MODAL_BOOKMARK */
-    const char* name = gtk_editable_get_text(GTK_EDITABLE(modal_entry1));
-    const char* url = gtk_editable_get_text(GTK_EDITABLE(modal_entry2));
+    /* MODAL_BOOKMARK -- trim both fields so a pasted URL/name with surrounding
+     * whitespace is stored clean (and later navigates instead of searching). */
+    char* name = g_strstrip(g_strdup(gtk_editable_get_text(GTK_EDITABLE(modal_entry1))));
+    char* url = g_strstrip(g_strdup(gtk_editable_get_text(GTK_EDITABLE(modal_entry2))));
     if (name[0] != '\0' && url[0] != '\0')
         bookmarks_save(BOOKMARKS_DIR, name, url);
+    g_free(name);
+    g_free(url);
     modal_hide();
 }
 
