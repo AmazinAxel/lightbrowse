@@ -330,6 +330,11 @@ static WebKitSettings* get_shared_settings(void)
          * with no GL this would force the slow software path, so it's deliberate. */
         webkit_settings_set_hardware_acceleration_policy(settings,
             WEBKIT_HARDWARE_ACCELERATION_POLICY_ALWAYS);
+        /* Expose the EME (Encrypted Media Extensions) API so DRM sites stop
+         * reporting "protected content is not enabled". This only turns the API
+         * on; actually decrypting Widevine streams (Spotify, Netflix) additionally
+         * needs a Widevine CDM, which upstream WebKitGTK/nixpkgs does not ship. */
+        webkit_settings_set_enable_encrypted_media(settings, TRUE);
     }
     return settings;
 }
