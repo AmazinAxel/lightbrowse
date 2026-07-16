@@ -813,6 +813,12 @@ static gboolean on_decide_policy(WebKitWebView* view, WebKitPolicyDecision* deci
         const char* mime = resp ? webkit_uri_response_get_mime_type(resp) : NULL;
         if (mime != NULL && g_ascii_strcasecmp(mime, "application/pdf") == 0)
             return FALSE;
+        /* Only the resource the user actually navigated to can become a download.
+         * Subresources (beacons, pings, prefetch) that come back empty are tagged
+         * application/x-zerosize by WebKit -- an unsupported MIME -- and would
+         * otherwise be turned into bogus 0-byte "download" files (e.g. on YouTube). */
+        if (!webkit_response_policy_decision_is_main_frame_main_resource(rpd))
+            return FALSE;
         if (!webkit_response_policy_decision_is_mime_type_supported(rpd)) {
             webkit_policy_decision_download(decision);
             return TRUE;
