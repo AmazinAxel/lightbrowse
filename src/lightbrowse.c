@@ -1866,8 +1866,13 @@ static void handle_shortcut(func id)
             }
             break;
         }
-        case new_tab:
-            modal_show(MODAL_SEARCH, TRUE);
+        case new_tab: {
+            /* If the current tab is already blank (about:blank or nothing
+             * loaded), reuse it instead of spawning an empty tab beside it. */
+            const char* cur = view ? webkit_web_view_get_uri(view) : NULL;
+            gboolean blank = view && (cur == NULL || cur[0] == '\0'
+                                      || g_strcmp0(cur, "about:blank") == 0);
+            modal_show(MODAL_SEARCH, !blank);
             if (MAX_NUM_TABS != 0 && num_tabs >= MAX_NUM_TABS) {
                 gtk_label_set_text(modal_info, "Tab limit reached");
                 gtk_widget_set_visible(GTK_WIDGET(modal_info), TRUE);
@@ -1876,6 +1881,7 @@ static void handle_shortcut(func id)
                 modal_blocked = TRUE;
             }
             break;
+        }
         case close_tab:
             close_current_tab();
             break;
