@@ -320,11 +320,32 @@ static WebKitNetworkSession* get_shared_network_session(void)
     return session;
 }
 
+/* Flip on the in-development features listed in WEBKIT_ENABLED_FEATURES. They have
+ * no GObject properties, so they can only be reached through the feature list; walk
+ * it once and match by identifier. */
+static void enable_extra_features(WebKitSettings* settings)
+{
+    static const char* const wanted[] = { WEBKIT_ENABLED_FEATURES };
+    WebKitFeatureList* features = webkit_settings_get_all_features();
+    for (gsize i = 0; i < webkit_feature_list_get_length(features); i++) {
+        WebKitFeature* feature = webkit_feature_list_get(features, i);
+        const char* id = webkit_feature_get_identifier(feature);
+        for (gsize w = 0; w < G_N_ELEMENTS(wanted); w++) {
+            if (g_strcmp0(id, wanted[w]) == 0) {
+                webkit_settings_set_feature_enabled(settings, feature, TRUE);
+                break;
+            }
+        }
+    }
+    webkit_feature_list_unref(features);
+}
+
 static WebKitSettings* get_shared_settings(void)
 {
     static WebKitSettings* settings = NULL;
     if (settings == NULL) {
         settings = webkit_settings_new_with_settings(WEBKIT_DEFAULT_SETTINGS, NULL);
+        enable_extra_features(settings);
         /* Keep the GPU compositor always on rather than ramping it up on demand per
          * page. Safe here: the target hardware has a working GPU (amdgpu); on a box
          * with no GL this would force the slow software path, so it's deliberate. */

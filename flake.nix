@@ -13,6 +13,40 @@
       # recompile the content-blocker JSON exactly once (see content_filters.c).
       converterVersion = "v2026.06.30";
 
+      # WebKitGTK with the features nixpkgs leaves compiled out.
+      #
+      # nixpkgs builds webkitgtk with `enableExperimental = false`, and the GTK
+      # port maps that single cmake switch (ENABLE_EXPERIMENTAL_FEATURES) onto a
+      # batch of whole subsystems -- see Source/cmake/OptionsGTK.cmake:124-148.
+      # With it off, these are absent from the binary no matter what
+      # WebKitSettings says at runtime:
+      #
+      #   ENABLE_WEB_RTC          RTCPeerConnection (our "enable-webrtc": true
+      #                           setting was inert without this)
+      #   ENABLE_ENCRYPTED_MEDIA  EME/DRM (likewise "enable-encrypted-media")
+      #   ENABLE_WEBXR (+_HIT_TEST, _LAYERS)
+      #   ENABLE_WK_WEB_EXTENSIONS
+      #   ENABLE_WEBDRIVER_BIDI
+      #
+      # It also pulls openssl + librice (WebRTC's ICE stack) and openxr-loader
+      # into the build inputs, which is why it has to be an override rather than
+      # extra cmakeFlags bolted on with overrideAttrs.
+      #
+      # Two things asked for are NOT here because the 2.52 release tarball cannot
+      # build them on the GTK port, regardless of flags:
+      #   * WebGPU  -- Source/WebGPU/WebGPU ships headers only (the Metal backend
+      #     is Cocoa-only) and OptionsGTK.cmake never mentions ENABLE_WEBGPU.
+      #   * WebAuthn -- UIProcess/WebAuthentication/AuthenticatorManager.cpp and
+      #     the CTAP/HID transports appear in no port's Sources*.txt, so
+      #     ENABLE_WEB_AUTHN=ON compiles the API and then fails to link.
+      #
+      # NOTE: no binary cache has this build (an override is a fresh derivation
+      # hash; Hydra only ever builds nixpkgs' default one). Expect one long local
+      # WebKit compile, then it is cached in /nix/store until nixpkgs bumps
+      # webkitgtk. `nix build .#webkitgtk` builds just this, so it can be pushed
+      # to a personal Cachix and shared across machines.
+      webkitgtkFor = pkgs: pkgs.webkitgtk_6_0.override { enableExperimental = true; };
+
       # The converter turns EasyList/uBO lists into WebKit content-blocker JSON
       # (network blocks + cosmetic hiding). Built from source so we can feed it our
       # own list set (adblock/filter_lists.toml — adds cookie/annoyance lists).
@@ -103,13 +137,14 @@
           # on GST_PLUGIN_SYSTEM_PATH_1_0, so it's added to the wrapper by hand below.
           pipewireGstPath = "${pkgs.pipewire}/lib/gstreamer-1.0";
 
+          webkitgtk = webkitgtkFor pkgs;
+
           buildInputs = (with pkgs; [
             glib
             glib-networking
             gsettings-desktop-schemas # color-scheme (website light/dark follows system)
             gtk4
-            webkitgtk_6_0
-          ]) ++ gstPlugins;
+          ]) ++ [ webkitgtk ] ++ gstPlugins;
 
           lightbrowse = pkgs.stdenv.mkDerivation {
             pname = "lightbrowse";
@@ -183,7 +218,9 @@
           };
         in {
           default = lightbrowse;
-          inherit lightbrowse;
+          # Exposed so the long WebKit compile can be built (and pushed to a
+          # personal binary cache) on its own: `nix build .#webkitgtk`.
+          inherit lightbrowse webkitgtk;
         });
 
       devShells = forAllSystems (system: pkgs:
@@ -212,13 +249,14 @@
               clang-tools # make format
             ]) ++ [ ublockConverter ]; # `make adblock` regenerates the filter JSON
 
+            # Same WebKit build the package links against, so `make run` and
+            # `nix build` behave identically (and share one compile).
             buildInputs = (with pkgs; [
               glib
               glib-networking
               gsettings-desktop-schemas
               gtk4
-              webkitgtk_6_0
-            ]) ++ gstPlugins;
+            ]) ++ [ (webkitgtkFor pkgs) ] ++ gstPlugins;
 
             # needed for networking
             shellHook = ''

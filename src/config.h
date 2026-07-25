@@ -62,6 +62,39 @@
     "enable-dns-prefetching", true, \
     "default-charset", "utf-8"
 
+/* Web platform features WebKitGTK ships but leaves off by default (they are
+ * "in development" upstream, i.e. not yet on in Safari). Each one below was
+ * checked against this WebKitGTK (2.52) to confirm it actually materialises the
+ * API rather than just existing as a build flag -- see webkit_settings_set_feature_enabled
+ * in get_shared_settings(). Turning them on is what closes most of the gap
+ * against a feature-detection test; the rest of the gap is APIs WebKit has never
+ * implemented (Web Bluetooth/USB/Serial/HID/NFC/MIDI/XR, the generic sensors,
+ * Battery, Vibration, EyeDropper, IdleDetector, PaymentRequest, Houdini,
+ * scheduler.postTask, launchQueue) or that nixpkgs does not build (WebGPU,
+ * WebAuthn, WebRTC).
+ *
+ * Deliberately *not* enabled, because WebKitGTK exposes them as non-functional
+ * stubs -- a site that feature-detects them takes a broken path instead of its
+ * fallback: ShapeDetection (Barcode/Face/TextDetector; getSupportedFormats()
+ * returns []) and ContactPickerAPI (no platform picker on Linux). */
+#define WEBKIT_ENABLED_FEATURES              \
+    "StorageAPI",              /* navigator.storage */          \
+    "StorageAPIEstimate",      /* navigator.storage.estimate() */ \
+    "FileSystem",              /* OPFS: navigator.storage.getDirectory() */ \
+    "FileSystemWritableStream",                                 \
+    "ScreenOrientationAPI",                                     \
+    "ScreenOrientationLockingAPI",                              \
+    "WebShare",                /* navigator.share/canShare */   \
+    "WebShareFileAPI",                                          \
+    "ImageCapture",            /* still frames off a getUserMedia track */ \
+    "WebTransport",                                             \
+    "PushAPI",                                                  \
+    "BackgroundFetchAPI",                                       \
+    "CookieStoreManager",      /* CookieStoreAPI is on already */ \
+    "CloseWatcher",            /* Esc/back closing dialogs and popovers */ \
+    "RequestIdleCallback",     /* widely assumed present by JS frameworks */ \
+    "LinkPrefetch"             /* honour <link rel=prefetch>, cf. dns-prefetching above */
+
 #define KEY(x) GDK_KEY_##x
 #define SFT  1 << 0
 #define CTRL 1 << 2
