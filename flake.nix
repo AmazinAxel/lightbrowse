@@ -185,7 +185,8 @@
             glib-networking
             gsettings-desktop-schemas # color-scheme (website light/dark follows system)
             gtk4
-          ]) ++ [ webkitgtk ] ++ gstPlugins;
+            webkitgtk_6_0
+          ]) ++ gstPlugins;
 
           lightbrowse = pkgs.stdenv.mkDerivation {
             pname = "lightbrowse";
@@ -261,7 +262,7 @@
           default = lightbrowse;
           # Exposed so the long WebKit compile can be built (and pushed to a
           # personal binary cache) on its own: `nix build .#webkitgtk`.
-          inherit lightbrowse webkitgtk;
+          inherit lightbrowse ;
         });
 
       devShells = forAllSystems (system: pkgs:
@@ -297,7 +298,8 @@
               glib-networking
               gsettings-desktop-schemas
               gtk4
-            ]) ++ [ (webkitgtkFor pkgs) ] ++ gstPlugins;
+              webkitgtk_6_0
+            ]) ++ gstPlugins;
 
             # needed for networking
             shellHook = ''
