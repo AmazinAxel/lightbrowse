@@ -77,16 +77,16 @@
       # cgroup with SIGTERM (nix reports "exit code 143") around 85% done.
       # ninja takes the last -j on the line, and the setup hook puts $ninjaFlags
       # after its own, so this wins.
-      webkitgtkFor = pkgs:
-        (pkgs.webkitgtk_6_0.override { enableExperimental = true; })
-        .overrideAttrs (old: {
-          separateDebugInfo = false;
-          ninjaFlags = (old.ninjaFlags or [ ]) ++ [ "-j3" ];
-          cmakeFlags = old.cmakeFlags ++ [
-            "-DENABLE_MINIBROWSER=OFF"
-            "-DENABLE_DOCUMENTATION=OFF"
-          ];
-        });
+      # webkitgtkFor = pkgs:
+      #   (pkgs.webkitgtk_6_0.override { enableExperimental = true; })
+      #   .overrideAttrs (old: {
+      #     separateDebugInfo = false;
+      #     ninjaFlags = (old.ninjaFlags or [ ]) ++ [ "-j3" ];
+      #     cmakeFlags = old.cmakeFlags ++ [
+      #       "-DENABLE_MINIBROWSER=OFF"
+      #       "-DENABLE_DOCUMENTATION=OFF"
+      #     ];
+      #   });
 
       # The converter turns EasyList/uBO lists into WebKit content-blocker JSON
       # (network blocks + cosmetic hiding). Built from source so we can feed it our
@@ -178,7 +178,7 @@
           # on GST_PLUGIN_SYSTEM_PATH_1_0, so it's added to the wrapper by hand below.
           pipewireGstPath = "${pkgs.pipewire}/lib/gstreamer-1.0";
 
-          webkitgtk = webkitgtkFor pkgs;
+          # webkitgtk = webkitgtkFor pkgs;
 
           buildInputs = (with pkgs; [
             glib
