@@ -45,7 +45,39 @@
       # WebKit compile, then it is cached in /nix/store until nixpkgs bumps
       # webkitgtk. `nix build .#webkitgtk` builds just this, so it can be pushed
       # to a personal Cachix and shared across machines.
-      webkitgtkFor = pkgs: pkgs.webkitgtk_6_0.override { enableExperimental = true; };
+      # The overrideAttrs on top only trims build cost -- none of it changes the
+      # runtime library. WebKit is already configured for speed upstream (Skia
+      # rather than Cairo, JIT+FTL, bmalloc), so there is nothing to add there;
+      # what is worth removing is work we never consume:
+      #
+      #   separateDebugInfo  nixpkgs sets this, which puts -g on every WebKit
+      #                      translation unit. Debug info dominates compile
+      #                      memory and disk here and lands in a `debug` output
+      #                      nothing reads. Dropping it is the single biggest
+      #                      build-time saving, and it lowers the peak memory
+      #                      that makes this build risky on a small machine.
+      #   ENABLE_MINIBROWSER WebKit's own sample browser (GTK default ON);
+      #                      nixpkgs already turns it off on Darwin, so the
+      #                      no-MiniBrowser config is upstream-supported.
+      #   ENABLE_DOCUMENTATION  runs gi-docgen over the whole API to fill the
+      #                      devdoc output. Safe to skip: the derivation's
+      #                      postFixup moveToOutput no-ops when share/doc is
+      #                      absent (nixpkgs multiple-outputs.sh:117), so devdoc
+      #                      just comes out empty instead of failing.
+      #
+      # Deliberately NOT set: LTO_MODE=thin. It is the only remaining change that
+      # would actually speed up *browsing* (~5%), but ThinLTO linking
+      # libwebkitgtk wants 8-16GB and this machine has 7GB, so the link would run
+      # out of swap at the very end of a multi-hour build.
+      webkitgtkFor = pkgs:
+        (pkgs.webkitgtk_6_0.override { enableExperimental = true; })
+        .overrideAttrs (old: {
+          separateDebugInfo = false;
+          cmakeFlags = old.cmakeFlags ++ [
+            "-DENABLE_MINIBROWSER=OFF"
+            "-DENABLE_DOCUMENTATION=OFF"
+          ];
+        });
 
       # The converter turns EasyList/uBO lists into WebKit content-blocker JSON
       # (network blocks + cosmetic hiding). Built from source so we can feed it our
