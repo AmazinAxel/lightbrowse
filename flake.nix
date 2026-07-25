@@ -69,10 +69,19 @@
       # would actually speed up *browsing* (~5%), but ThinLTO linking
       # libwebkitgtk wants 8-16GB and this machine has 7GB, so the link would run
       # out of swap at the very end of a multi-hour build.
+      #
+      # ninjaFlags caps parallelism regardless of how many cores nix hands the
+      # build. WebCore's unified sources are the fattest translation units here
+      # (~2GB of clang each at -O3), so ninja's default -j$NIX_BUILD_CORES = 8
+      # drives a 7GB machine into swap; systemd-oomd then kills the whole build
+      # cgroup with SIGTERM (nix reports "exit code 143") around 85% done.
+      # ninja takes the last -j on the line, and the setup hook puts $ninjaFlags
+      # after its own, so this wins.
       webkitgtkFor = pkgs:
         (pkgs.webkitgtk_6_0.override { enableExperimental = true; })
         .overrideAttrs (old: {
           separateDebugInfo = false;
+          ninjaFlags = (old.ninjaFlags or [ ]) ++ [ "-j3" ];
           cmakeFlags = old.cmakeFlags ++ [
             "-DENABLE_MINIBROWSER=OFF"
             "-DENABLE_DOCUMENTATION=OFF"
