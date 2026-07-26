@@ -278,6 +278,30 @@ static WebKitWebContext* get_shared_web_context(void)
         webkit_web_context_set_cache_model(context, WEBKIT_CACHE_MODEL_WEB_BROWSER);
         /* Ad blocking is no longer a web-process extension: it runs as native
          * WebKit content filters attached per view (see adblock_apply_to_view). */
+
+        /* Screen sharing: getDisplayMedia gets its stream from the xdg-desktop-portal
+         * ScreenCast interface, which hands back a PipeWire node that WebKit reads
+         * with GStreamer's pipewiresrc. pipewiresrc still has to connect to the
+         * PipeWire *daemon* socket, and WebKit's bubblewrap sandbox binds PulseAudio's
+         * socket into the web process but not PipeWire's -- so the portal negotiates a
+         * stream fine and then no buffers ever arrive, which surfaces as the web
+         * process spamming "gst_buffer_insert_memory: assertion 'mem != NULL' failed"
+         * and a video track that stays black. Bind the socket in explicitly; it must be
+         * writable, as a socket is useless read-only. */
+        const char* runtime_dir = g_get_user_runtime_dir();
+        if (runtime_dir != NULL) {
+            /* PIPEWIRE_REMOTE names the socket when it isn't the default pipewire-0.
+             * An absolute value is a full path; otherwise it's relative to the runtime dir. */
+            const char* remote = g_getenv("PIPEWIRE_REMOTE");
+            if (remote == NULL || remote[0] == '\0')
+                remote = "pipewire-0";
+            char* socket_path = g_path_is_absolute(remote)
+                ? g_strdup(remote)
+                : g_build_filename(runtime_dir, remote, NULL);
+            if (g_file_test(socket_path, G_FILE_TEST_EXISTS))
+                webkit_web_context_add_path_to_sandbox(context, socket_path, FALSE);
+            g_free(socket_path);
+        }
     }
     return context;
 }
@@ -1030,13 +1054,22 @@ static gboolean perm_describe(WebKitWebView* view, WebKitPermissionRequest* requ
         WebKitUserMediaPermissionRequest* um = WEBKIT_USER_MEDIA_PERMISSION_REQUEST(request);
         gboolean audio = webkit_user_media_permission_is_for_audio_device(um);
         gboolean video = webkit_user_media_permission_is_for_video_device(um);
-        const char* kind = (audio && video) ? "microphone &amp; camera"
-            : video                         ? "camera"
-                                            : "microphone";
+        /* getDisplayMedia arrives as a user-media request too, flagged as a display
+         * device — without this branch a screen-share prompt reads "microphone". */
+        gboolean display = webkit_user_media_permission_is_for_display_device(um);
+        const char* kind = display ? "to share your screen"
+            : (audio && video)     ? "microphone &amp; camera access"
+            : video                ? "camera access"
+                                   : "microphone access";
         char* host = view_host(view);
         char* who = g_markup_escape_text(host != NULL ? host : "This site", -1);
-        *key = host; /* takes host (NULL for about:/file: — those aren't remembered) */
-        *msg = g_strdup_printf("<b>%s</b> wants %s access%s", who, kind, hint);
+        /* Screen capture reveals far more than the camera does, so it gets its own
+         * session-memory key: allowing the camera on a host must not silently hand
+         * that same host the whole screen later. */
+        *key = (host != NULL && display) ? g_strdup_printf("display\n%s", host) : host;
+        if (host != NULL && display)
+            g_free(host); /* key is the prefixed copy; the bare host is spent */
+        *msg = g_strdup_printf("<b>%s</b> wants %s%s", who, kind, hint);
         g_free(who);
         return TRUE;
     }
