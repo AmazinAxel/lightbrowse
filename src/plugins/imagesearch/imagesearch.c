@@ -9,20 +9,24 @@
  * family. The results page then rejects the session ("unusual traffic", or a
  * broken thumbnail that never loads).
  *
- * So the upload is done *by the tab itself*: load a page on lens.google.com,
- * then build a form there whose file input is filled from a DataTransfer and
- * submit it. A form POST is an ordinary navigation -- no CORS involved -- so the
- * tab follows the redirect and lands on the results with the browser's own
- * cookies, IP and user agent. Bootstrapping from a lens.google.com page (rather
- * than about:blank) keeps the POST same-site, so the user's Google session
- * cookies ride along and the results are personalised as they would be in any
- * other browser. */
+ * So the upload is done *by the tab itself*: give the tab a small generated
+ * document whose script builds a form, fills its file input from a DataTransfer
+ * and submits it. A form POST is an ordinary navigation -- no CORS involved --
+ * so the tab follows the redirect and lands on the results with the browser's
+ * own cookies, IP and user agent.
+ *
+ * The document is loaded with a lens.google.com base URI rather than fetched
+ * from the network. That keeps the POST same-site, so the user's Google session
+ * cookies ride along and the results are personalised as in any other browser --
+ * and it costs no round trip, so no intermediate page is ever shown. (Fetching a
+ * real page to bootstrap from meant staring at whatever Google served, e.g. its
+ * 404, until the POST went through.) */
 
 #include "imagesearch.h"
 
-/* Cheapest same-origin page to bootstrap from: it is small, cacheable, and
- * exists purely to give the form a lens.google.com document to submit from. */
-#define LENS_BOOTSTRAP_URI "https://lens.google.com/robots.txt"
+/* Origin the generated document claims, so the POST to /upload is same-site.
+ * Only its origin matters -- nothing is ever fetched from this URI. */
+#define LENS_BASE_URI "https://lens.google.com/"
 
 /* Image types we hand to Lens, best first. The clipboard is read as raw bytes in
  * one of these and passed through untouched -- deliberately *not* via
@@ -42,30 +46,25 @@ static const char* IMAGE_MIME_TYPES[] = {
 typedef struct {
     WebKitWebView* view;
     ImageSearchFailed on_error;
-    char* base64;
     char* mime; /* whichever of IMAGE_MIME_TYPES the clipboard gave us */
-    gulong load_changed;
-    gulong load_failed;
 } Upload;
 
 static void upload_free(Upload* up)
 {
-    if (up->load_changed != 0)
-        g_signal_handler_disconnect(up->view, up->load_changed);
-    if (up->load_failed != 0)
-        g_signal_handler_disconnect(up->view, up->load_failed);
     g_object_unref(up->view);
-    g_free(up->base64);
     g_free(up->mime);
     g_free(up);
 }
 
-/* Rebuild the image inside the page, hang it off a file input via DataTransfer
- * (the one way script may populate one), and submit. */
-static void submit_form(Upload* up)
+/* Hand the tab a document that rebuilds the image, hangs it off a file input via
+ * DataTransfer (the one way script may populate one) and submits. It paints the
+ * chrome's own background so the moment before the POST navigates away is not a
+ * white flash. */
+static void submit_form(Upload* up, const char* base64)
 {
-    char* js = g_strdup_printf(
-        "(function(){try{"
+    char* html = g_strdup_printf(
+        "<!doctype html><meta charset=\"utf-8\">"
+        "<body style=\"margin:0;background:#2E3440\"><script>"
         "var bin=atob('%s');var a=new Uint8Array(bin.length);"
         "for(var i=0;i<bin.length;i++)a[i]=bin.charCodeAt(i);"
         "var dt=new DataTransfer();"
@@ -73,36 +72,14 @@ static void submit_form(Upload* up)
         "var f=document.createElement('form');"
         "f.method='POST';f.enctype='multipart/form-data';"
         "f.action='https://lens.google.com/upload';"
-        "var i=document.createElement('input');"
-        "i.type='file';i.name='encoded_image';"
-        "f.appendChild(i);document.body.appendChild(f);"
-        "i.files=dt.files;"
-        "if(i.files.length!==1)return 'file input rejected the image';"
-        "f.submit();return '';"
-        "}catch(e){return ''+e;}})()",
-        up->base64, up->mime);
-    webkit_web_view_evaluate_javascript(up->view, js, -1, NULL, NULL, NULL, NULL, NULL);
-    g_free(js);
-}
-
-static void on_load_changed(WebKitWebView* view, WebKitLoadEvent event, gpointer data)
-{
-    Upload* up = data;
-    if (event != WEBKIT_LOAD_FINISHED)
-        return;
-    /* Only ever inject into the page we asked for: if the user typed elsewhere
-     * while it loaded, drop the upload rather than scripting their page. */
-    const char* uri = webkit_web_view_get_uri(view);
-    if (g_strcmp0(uri, LENS_BOOTSTRAP_URI) == 0)
-        submit_form(up);
-    upload_free(up);
-}
-
-static gboolean on_load_failed(WebKitWebView* view, WebKitLoadEvent event,
-    const char* failing_uri, GError* error, gpointer data)
-{
-    upload_free(data); /* WebKit shows its own error page */
-    return FALSE;
+        "var inp=document.createElement('input');"
+        "inp.type='file';inp.name='encoded_image';"
+        "f.appendChild(inp);document.body.appendChild(f);"
+        "inp.files=dt.files;f.submit();"
+        "</script>",
+        base64, up->mime);
+    webkit_web_view_load_html(up->view, html, LENS_BASE_URI);
+    g_free(html);
 }
 
 static void fail(Upload* up, const char* reason)
@@ -139,12 +116,11 @@ static void on_spliced(GObject* source, GAsyncResult* res, gpointer data)
         fail(up, "the image is too large to search");
         return;
     }
-    up->base64 = g_base64_encode(raw, len);
+    char* base64 = g_base64_encode(raw, len);
     g_bytes_unref(image);
-
-    up->load_changed = g_signal_connect(up->view, "load-changed", G_CALLBACK(on_load_changed), up);
-    up->load_failed = g_signal_connect(up->view, "load-failed", G_CALLBACK(on_load_failed), up);
-    webkit_web_view_load_uri(up->view, LENS_BOOTSTRAP_URI);
+    submit_form(up, base64);
+    g_free(base64);
+    upload_free(up);
 }
 
 static void on_clipboard_read(GObject* source, GAsyncResult* res, gpointer data)
