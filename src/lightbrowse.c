@@ -1099,6 +1099,16 @@ static gboolean on_permission_request(WebKitWebView* view,
         return TRUE;
     }
 
+    /* Reading an image or video off the clipboard goes through
+     * navigator.clipboard.read(), which lands here — denied by default, so media
+     * paste silently does nothing. WebKit only asks on a user gesture, so a site
+     * can't snoop the clipboard on its own; allowing silently just makes Ctrl+V
+     * work, where a modal on every paste would not be worth it. */
+    if (WEBKIT_IS_CLIPBOARD_PERMISSION_REQUEST(request)) {
+        webkit_permission_request_allow(request);
+        return TRUE;
+    }
+
     char* key = NULL;
     char* msg = NULL;
     /* Anything we don't describe keeps WebKit's safe default (denied). */
@@ -1322,6 +1332,12 @@ static void session_save(void)
     for (int i = 0; i < n; i++) {
         WebKitWebView* v = WEBKIT_WEB_VIEW(gtk_notebook_get_nth_page(notebook, i));
         const char* uri = webkit_web_view_get_uri(v);
+        /* A lazily-restored tab the user never switched to has no URI of its own —
+         * it was never loaded — so fall back to the URL we're holding for it.
+         * Without this, restoring N tabs and reopening only one silently drops the
+         * other N-1 from the session the next time it's saved. */
+        if (uri == NULL || uri[0] == '\0')
+            uri = g_object_get_data(G_OBJECT(v), "reload-uri");
         if (uri == NULL || uri[0] == '\0' || g_str_has_prefix(uri, "about:"))
             continue;
         g_string_append(s, uri);
@@ -2264,6 +2280,8 @@ static void build_findbar(void)
 
 /* ------------------------------------------------------------ application */
 static GtkApplication* app;
+static gboolean prewarm = FALSE; /* --prewarm: build the window but keep it hidden */
+static gboolean shown = FALSE;   /* the window has been presented to the user */
 
 /* Window manager / sway close (the X): save the open tabs, then allow it. */
 static gboolean on_close_request(GtkWindow* w, gpointer data)
@@ -2394,33 +2412,47 @@ static gboolean startup_deferred(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
-static void startup_defer(char** uris)
+/* First real launch: put the window on screen, then let everything else follow.
+ * `uris` (may be NULL) is handed to the deferred phase, which owns it. */
+static void startup_show(char** uris)
 {
+    ensure_window(); /* a no-op after --prewarm: the window is already built */
+    /* Decide on the modal from a bare stat, before presenting, so a launch with no
+     * session shows its search box in the very first frame rather than a frame later. */
+    if (uris == NULL && !session_exists())
+        modal_show(MODAL_SEARCH, FALSE);
+    gtk_window_present(window);
+    shown = TRUE;
     g_idle_add_full(G_PRIORITY_LOW, startup_deferred, uris, NULL);
 }
 
 /* Launched with no URL (or a second plain invocation): show the search modal. */
 static void on_activate(GApplication* application, gpointer data)
 {
-    if (window != NULL) { /* already running: just raise it */
+    /* --prewarm: build and realize the window without mapping it, so GTK's window
+     * setup and the GSK renderer (together the bulk of a cold launch) are already
+     * paid for. The launch that follows only has to map an existing surface, which
+     * puts the window on screen in ~10ms instead of ~400ms. Nothing else is warmed:
+     * no tab, and no ad-block filters (loading those costs ~110MB resident, and they
+     * are only needed once a page actually loads), so an idle prewarm stays cheap. */
+    if (prewarm) {
+        prewarm = FALSE; /* one prewarm; any later activation is a real launch */
+        ensure_window();
+        gtk_widget_realize(GTK_WIDGET(window));
+        return; /* the (hidden) window keeps GtkApplication alive on its own */
+    }
+
+    if (shown) { /* already up: just raise it */
         gtk_window_present(window);
         return;
     }
-    ensure_window();
-    /* Decide on the modal from a bare stat, before presenting, so a launch with no
-     * session shows its search box in the very first frame rather than a frame later. */
-    if (!session_exists())
-        modal_show(MODAL_SEARCH, FALSE);
-    gtk_window_present(window);
-    startup_defer(NULL);
+    startup_show(NULL);
 }
 
 /* Launched/activated with URLs (default-browser link handling). No modal. */
 static void on_open(GApplication* application, GFile** files, gint n_files, const char* hint, gpointer data)
 {
-    gboolean fresh = (window == NULL);
-    ensure_window();
-    if (!fresh) { /* already running: the engine is warm, open straight away */
+    if (shown) { /* already up: the engine is warm, so open straight away */
         for (gint i = 0; i < n_files; i++) {
             char* uri = g_file_get_uri(files[i]);
             notebook_create_new_tab(uri);
@@ -2433,14 +2465,102 @@ static void on_open(GApplication* application, GFile** files, gint n_files, cons
     GPtrArray* uris = g_ptr_array_new();
     for (gint i = 0; i < n_files; i++)
         g_ptr_array_add(uris, g_file_get_uri(files[i]));
-    g_ptr_array_add(uris, NULL);
-    gtk_window_present(window);
-    startup_defer((char**)g_ptr_array_free(uris, FALSE));
+    g_ptr_array_add(uris, NULL); /* startup_deferred walks it as a NULL-terminated list */
+    startup_show((char**)g_ptr_array_free(uris, FALSE));
+}
+
+#define APP_ID "com.amazinaxel.lightbrowse"
+#define APP_PATH "/com/amazinaxel/lightbrowse"
+
+/* Raise (or hand URLs to) an instance that is already running, straight over
+ * D-Bus. GApplication does this handoff itself, but only after building a
+ * GtkApplication and registering it — ~100ms of setup this short-lived process
+ * never needs, which is the difference between a launch key that feels instant
+ * and one that lags. Returns TRUE if the running instance took the request;
+ * FALSE (no instance, or it went away mid-call) means start up normally.
+ * With `probe_only` nothing is sent: a --prewarm launch just wants to know
+ * whether warming is pointless because an instance is already there. */
+static gboolean forward_to_running_instance(int argc, char** argv, gboolean probe_only)
+{
+    GDBusConnection* bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
+    if (bus == NULL)
+        return FALSE;
+
+    gboolean handled = FALSE;
+    if (probe_only) {
+        GVariant* owned = g_dbus_connection_call_sync(bus, "org.freedesktop.DBus",
+            "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner",
+            g_variant_new("(s)", APP_ID), G_VARIANT_TYPE("(b)"),
+            G_DBUS_CALL_FLAGS_NO_AUTO_START, 1000, NULL, NULL);
+        if (owned != NULL) {
+            g_variant_get(owned, "(b)", &handled);
+            g_variant_unref(owned);
+        }
+        g_object_unref(bus);
+        return handled;
+    }
+
+    GVariantBuilder platform;
+    g_variant_builder_init(&platform, G_VARIANT_TYPE("a{sv}")); /* no platform data to pass */
+
+    const char* method;
+    GVariant* args;
+    if (argc > 1) { /* org.gtk.Application.Open(as uris, s hint, a{sv}) */
+        GVariantBuilder uris;
+        g_variant_builder_init(&uris, G_VARIANT_TYPE("as"));
+        for (int i = 1; i < argc; i++) {
+            /* Same conversion GApplication applies to its own arguments, so a bare
+             * path, a relative one and a full URL all arrive as the running
+             * instance would have built them. */
+            GFile* file = g_file_new_for_commandline_arg(argv[i]);
+            char* uri = g_file_get_uri(file);
+            g_variant_builder_add(&uris, "s", uri);
+            g_free(uri);
+            g_object_unref(file);
+        }
+        GVariant* children[] = { g_variant_builder_end(&uris),
+            g_variant_new_string(""), g_variant_builder_end(&platform) };
+        method = "Open";
+        args = g_variant_new_tuple(children, G_N_ELEMENTS(children));
+    } else { /* org.gtk.Application.Activate(a{sv}) */
+        GVariant* child = g_variant_builder_end(&platform);
+        method = "Activate";
+        args = g_variant_new_tuple(&child, 1);
+    }
+
+    /* NO_AUTO_START: a missing instance must fall through to a normal launch here,
+     * not have the bus try to spawn one. */
+    GVariant* reply = g_dbus_connection_call_sync(bus, APP_ID, APP_PATH,
+        "org.gtk.Application", method, args, NULL,
+        G_DBUS_CALL_FLAGS_NO_AUTO_START, 1000, NULL, NULL);
+    if (reply != NULL) {
+        g_variant_unref(reply);
+        handled = TRUE;
+    }
+    g_object_unref(bus);
+    return handled;
 }
 
 int main(int argc, char** argv)
 {
-    app = gtk_application_new("com.amazinaxel.lightbrowse", G_APPLICATION_HANDLES_OPEN);
+    /* Strip --prewarm before GApplication sees it: with HANDLES_OPEN it would take
+     * any leftover argument for a file to open. */
+    int keep = 1;
+    for (int i = 1; i < argc; i++) {
+        if (g_strcmp0(argv[i], "--prewarm") == 0)
+            prewarm = TRUE;
+        else
+            argv[keep++] = argv[i];
+    }
+    argv[keep] = NULL;
+    argc = keep;
+
+    /* Nothing below this needs to run when an instance is already up: it either
+     * took the request or (--prewarm) there is nothing left to warm. */
+    if (forward_to_running_instance(argc, argv, prewarm))
+        return 0;
+
+    app = gtk_application_new(APP_ID, G_APPLICATION_HANDLES_OPEN);
     g_signal_connect(app, "activate", G_CALLBACK(on_activate), NULL);
     g_signal_connect(app, "open", G_CALLBACK(on_open), NULL);
     g_unix_signal_add(SIGTERM, on_term_signal, NULL); /* save tabs on shutdown */
