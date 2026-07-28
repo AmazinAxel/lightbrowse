@@ -42,47 +42,81 @@ static const char* CSS =
     "progressbar.downloadbar trough { border: none; background: transparent; border-radius: 0; padding: 0; min-height: 3px; }"
     "progressbar.downloadbar progress { border: none; border-radius: 0; background: #a3be8c; }";
 
-/* Global widgets */
-static GtkWindow* window;
-static GtkOverlay* overlay;
-static GtkNotebook* notebook;
-static GtkBox* tabbar; /* vertical favicon strip */
-static gboolean tabbar_visible = TRUE;
-static int num_tabs = 0;
-
-/* Most-recently-used tab history (alt+tab walks back through it). The front
- * (index 0) is the current tab, except during an active alt+tab walk: then the
- * displayed tab is mru[alt_walk] and the list is only reshuffled once the user
- * releases Alt, so repeated Tab presses keep stepping deeper into history. */
-static GtkWidget* mru[MRU_HISTORY];
-static int mru_len = 0;
-static int alt_walk = -1;            /* index into mru during a walk; -1 when idle */
-static gboolean alt_switch = FALSE;  /* TRUE while the walk drives the page switch itself */
-
-/* Modal (search / bookmark / password picker) */
+/* Everything below belongs to one browser window. The process can own several:
+ * the main window (whose tabs are the saved session) plus any number of scratch
+ * windows, which start empty and are never written to the session. They all share
+ * one WebKit engine, network session and ad-block filter set, so a second window
+ * costs a fraction of a second process — and opens in the time it takes to map it.
+ *
+ * User-driven code (keys, the modal, find) acts on cur(): the window the user is
+ * focused on. Anything driven by a web view instead resolves its own window with
+ * win_of(view), so a page loading in a background window can't repaint the chrome
+ * of the one you're looking at. */
 typedef enum { MODAL_NONE, MODAL_SEARCH, MODAL_BOOKMARK, MODAL_PASSWORD, MODAL_PERMISSION } ModalMode;
-static ModalMode modal_mode = MODAL_NONE;
-static gboolean modal_new_tab = FALSE; /* search: open in a new tab vs current */
-static gboolean modal_blocked = FALSE; /* tab limit reached: don't open on submit */
-static GtkWidget* dim;
-static GtkWidget* modal_box;
-static GtkLabel* modal_info;
-static GtkEntry* modal_entry1; /* search text / bookmark name */
-static GtkEntry* modal_entry2; /* bookmark url (hidden in search mode) */
-static GtkBox* modal_results;
-static GtkLabel* calc_label; /* search: live calculation result, shown under the entry */
-static gboolean calc_active = FALSE; /* a valid calculation is currently displayed */
-static char calc_result[64]; /* its formatted value, for the clipboard */
-static const char* fuzzy_urls[FUZZY_RESULTS];
-static guint fuzzy_count = 0;
-static int fuzzy_sel = -1;
 
-/* Password picker (MODAL_PASSWORD): pass_entries mirrors fuzzy_urls but holds
- * `pass` entry paths; pass_host is the current page's host we match against;
- * pass_target is the view to inject the filled credentials into. */
-static const char* pass_entries[FUZZY_RESULTS];
-static char pass_host[256];
-static WebKitWebView* pass_target = NULL;
+typedef struct {
+    gboolean is_main; /* the session-backed window; scratch windows are throwaway */
+
+    GtkWindow* window;
+    GtkOverlay* overlay;
+    GtkNotebook* notebook;
+    GtkBox* tabbar; /* vertical favicon strip */
+    gboolean tabbar_visible;
+    int num_tabs;
+
+    /* Most-recently-used tab history (alt+tab walks back through it). The front
+     * (index 0) is the current tab, except during an active alt+tab walk: then the
+     * displayed tab is mru[alt_walk] and the list is only reshuffled once the user
+     * releases Alt, so repeated Tab presses keep stepping deeper into history. */
+    GtkWidget* mru[MRU_HISTORY];
+    int mru_len;
+    int alt_walk;           /* index into mru during a walk; -1 when idle */
+    gboolean alt_switch;    /* TRUE while the walk drives the page switch itself */
+
+    /* Modal (search / bookmark / password picker) */
+    ModalMode modal_mode;
+    gboolean modal_new_tab; /* search: open in a new tab vs current */
+    gboolean modal_blocked; /* tab limit reached: don't open on submit */
+    GtkWidget* dim;
+    GtkWidget* modal_box;
+    GtkLabel* modal_info;
+    GtkEntry* modal_entry1; /* search text / bookmark name */
+    GtkEntry* modal_entry2; /* bookmark url (hidden in search mode) */
+    GtkBox* modal_results;
+    GtkLabel* calc_label;   /* search: live calculation result, shown under the entry */
+    gboolean calc_active;   /* a valid calculation is currently displayed */
+    char calc_result[64];   /* its formatted value, for the clipboard */
+    const char* fuzzy_urls[FUZZY_RESULTS];
+    guint fuzzy_count;
+    int fuzzy_sel;
+
+    /* Password picker (MODAL_PASSWORD): pass_entries mirrors fuzzy_urls but holds
+     * `pass` entry paths; pass_host is the current page's host we match against;
+     * pass_target is the view to inject the filled credentials into. */
+    const char* pass_entries[FUZZY_RESULTS];
+    char pass_host[256];
+    WebKitWebView* pass_target;
+
+    /* Find bar */
+    GtkWidget* findbar;
+    GtkEntry* find_entry;
+    GtkLabel* find_label;
+    guint find_total;
+    guint find_current;
+
+    /* Bottom status / loading bar (the whole bar hides when idle) */
+    GtkWidget* statusbar;   /* container: hidden unless loading or hovering */
+    GtkLabel* status_label; /* hovered or keyboard-focused link */
+    GtkProgressBar* progress;          /* page load progress (hidden when idle) */
+    GtkProgressBar* download_progress; /* green download progress, below the load bar */
+    char* status_link;      /* hovered or keyboard-focused link URI */
+    char* status_flash;     /* transient message (e.g. "Download started") */
+    guint status_flash_source;
+    gboolean page_loading;
+} Win;
+
+static Win* main_win = NULL;    /* the session-backed window; NULL until it is built */
+static GPtrArray* wins = NULL;  /* every live Win, main first */
 
 /* Permission prompts (camera/microphone getUserMedia + Storage Access API).
  * WebKitGTK denies every permission request unless the app allows it explicitly,
@@ -96,23 +130,7 @@ static WebKitPermissionRequest* perm_current = NULL; /* request awaiting a decis
 static GQueue perm_queue = G_QUEUE_INIT;             /* further requests, shown one at a time */
 static GHashTable* perm_allowed = NULL;              /* set of perm-keys granted this session */
 
-/* Find bar */
-static GtkWidget* findbar;
-static GtkEntry* find_entry;
-static GtkLabel* find_label;
-static guint find_total = 0;
-static guint find_current = 0;
-
-/* Bottom status / loading bar (the whole bar hides when idle) */
-static GtkWidget* statusbar;       /* container: hidden unless loading or hovering */
-static GtkLabel* status_label;     /* hovered or keyboard-focused link */
-static GtkProgressBar* progress;   /* page load progress (hidden when idle) */
-static GtkProgressBar* download_progress; /* green download progress, below the load bar */
 static int active_downloads = 0;
-static char* status_link = NULL;   /* hovered or keyboard-focused link URI */
-static char* status_flash = NULL;  /* transient message (e.g. "Download started") */
-static guint status_flash_source = 0;
-static gboolean page_loading = FALSE;
 
 /* Closed-tab ring (full WebKit session state, so the webview is freed) */
 static WebKitWebViewSessionState* closed_tabs[CLOSED_TAB_HISTORY];
@@ -128,19 +146,36 @@ static gboolean resident = FALSE;
 static gboolean tearing_down = FALSE; /* tabs are being dropped; ignore the churn */
 
 /* Forward declarations */
-static void notebook_create_new_tab(const char* uri);
+static void notebook_create_new_tab(Win* w, const char* uri);
 static void session_save_queue(void);
-static void window_hide_to_resident(void);
-static WebKitWebView* current_view(void);
-static void do_find(const char* text);
+static void window_hide_to_resident(Win* w);
+static void window_destroy_scratch(Win* w);
+static WebKitWebView* current_view(Win* w);
+static void do_find(Win* w, const char* text);
 static void session_save(void);
-static void update_status(void);
+static void update_status(Win* w);
 static void on_download_started(WebKitNetworkSession* session, WebKitDownload* download, gpointer data);
-static void mru_promote(GtkWidget* page);
-static void mru_remove(GtkWidget* page);
+static void mru_promote(Win* w, GtkWidget* page);
+static void mru_remove(Win* w, GtkWidget* page);
 static void tab_set_asleep(WebKitWebView* view, gboolean asleep);
-static void modal_show_permission(const char* markup);
-static void modal_hide(void);
+static void modal_show_permission(Win* w, const char* markup);
+static void modal_hide(Win* w);
+
+/* The window a web view lives in (stashed on the view when its tab is built). */
+static Win* win_of(WebKitWebView* view)
+{
+    return view ? g_object_get_data(G_OBJECT(view), "win") : NULL;
+}
+
+/* The window the user is acting on: GTK tracks which of our windows has focus,
+ * and everything keyboard- or modal-driven follows it. Falls back to the main
+ * window, which is the only one that exists before anything is focused. */
+static Win* cur(void)
+{
+    GtkWindow* active = gtk_application_get_active_window(GTK_APPLICATION(g_application_get_default()));
+    Win* w = active ? g_object_get_data(G_OBJECT(active), "win") : NULL;
+    return w ? w : main_win;
+}
 
 /* ---------------------------------------------------------------- URI load */
 /* Does `s` carry an explicit URI scheme we should navigate to as-is? Accepts a
@@ -392,39 +427,44 @@ static WebKitSettings* get_shared_settings(void)
     return settings;
 }
 
-static WebKitWebView* current_view(void)
+static WebKitWebView* current_view(Win* w)
 {
-    GtkWidget* page = gtk_notebook_get_nth_page(notebook, gtk_notebook_get_current_page(notebook));
+    if (w == NULL)
+        return NULL;
+    GtkWidget* page = gtk_notebook_get_nth_page(w->notebook, gtk_notebook_get_current_page(w->notebook));
     return page ? WEBKIT_WEB_VIEW(page) : NULL;
 }
 
 /* ----------------------------------- status bar (link hover + load progress) */
-static void update_status(void)
+static void update_status(Win* w)
 {
-    const char* text = status_flash ? status_flash : status_link; /* flash wins over hover */
-    gtk_label_set_text(status_label, text ? text : "");
-    gtk_widget_set_visible(GTK_WIDGET(status_label), text != NULL);
-    gtk_widget_set_visible(GTK_WIDGET(progress), page_loading);
-    gtk_widget_set_visible(statusbar, text != NULL || page_loading || active_downloads > 0);
+    const char* text = w->status_flash ? w->status_flash : w->status_link; /* flash wins over hover */
+    gtk_label_set_text(w->status_label, text ? text : "");
+    gtk_widget_set_visible(GTK_WIDGET(w->status_label), text != NULL);
+    gtk_widget_set_visible(GTK_WIDGET(w->progress), w->page_loading);
+    gtk_widget_set_visible(w->statusbar, text != NULL || w->page_loading || active_downloads > 0);
 }
 
 static gboolean status_flash_clear(gpointer data)
 {
-    g_clear_pointer(&status_flash, g_free);
-    status_flash_source = 0;
-    update_status();
+    Win* w = data;
+    g_clear_pointer(&w->status_flash, g_free);
+    w->status_flash_source = 0;
+    update_status(w);
     return G_SOURCE_REMOVE;
 }
 
 /* Show a transient message in the status bar for 2 seconds. */
-static void status_flash_message(const char* msg)
+static void status_flash_message(Win* w, const char* msg)
 {
-    g_clear_pointer(&status_flash, g_free);
-    status_flash = g_strdup(msg);
-    if (status_flash_source != 0)
-        g_source_remove(status_flash_source);
-    status_flash_source = g_timeout_add_seconds(2, status_flash_clear, NULL);
-    update_status();
+    if (w == NULL)
+        return;
+    g_clear_pointer(&w->status_flash, g_free);
+    w->status_flash = g_strdup(msg);
+    if (w->status_flash_source != 0)
+        g_source_remove(w->status_flash_source);
+    w->status_flash_source = g_timeout_add_seconds(2, status_flash_clear, w);
+    update_status(w);
 }
 
 /* ----------------------------------------------------------------- downloads */
@@ -462,9 +502,14 @@ static gboolean on_download_destination(WebKitDownload* download, gchar* suggest
     return TRUE;
 }
 
+/* A download's progress belongs in the window it was started from, which is
+ * stamped on the download when it begins (see on_download_started). */
 static void on_download_progress(GObject* obj, GParamSpec* pspec, gpointer data)
 {
-    gtk_progress_bar_set_fraction(download_progress,
+    Win* w = g_object_get_data(obj, "win");
+    if (w == NULL)
+        return;
+    gtk_progress_bar_set_fraction(w->download_progress,
         webkit_download_get_estimated_progress(WEBKIT_DOWNLOAD(obj)));
 }
 
@@ -474,9 +519,12 @@ static void on_download_finished(WebKitDownload* download, gpointer data)
 {
     if (active_downloads > 0)
         active_downloads -= 1;
+    Win* w = g_object_get_data(G_OBJECT(download), "win");
+    if (w == NULL)
+        return;
     if (active_downloads == 0)
-        gtk_widget_set_visible(GTK_WIDGET(download_progress), FALSE);
-    update_status();
+        gtk_widget_set_visible(GTK_WIDGET(w->download_progress), FALSE);
+    update_status(w);
 }
 
 /* A download opened in a fresh tab (target=_blank / window.open) leaves that tab
@@ -485,15 +533,20 @@ static void on_download_finished(WebKitDownload* download, gpointer data)
 static gboolean close_blank_download_tab(gpointer data)
 {
     WebKitWebView* view = WEBKIT_WEB_VIEW(data);
-    int n = gtk_notebook_page_num(notebook, GTK_WIDGET(view));
-    if (n >= 0 && num_tabs > 1
+    Win* w = win_of(view);
+    if (w == NULL) {
+        g_object_unref(view);
+        return G_SOURCE_REMOVE;
+    }
+    int n = gtk_notebook_page_num(w->notebook, GTK_WIDGET(view));
+    if (n >= 0 && w->num_tabs > 1
         && webkit_back_forward_list_get_current_item(webkit_web_view_get_back_forward_list(view)) == NULL) {
-        mru_remove(GTK_WIDGET(view));
+        mru_remove(w, GTK_WIDGET(view));
         GtkWidget* btn = g_object_get_data(G_OBJECT(view), "button");
         if (btn != NULL)
-            gtk_box_remove(tabbar, btn);
-        gtk_notebook_remove_page(notebook, n);
-        num_tabs -= 1;
+            gtk_box_remove(w->tabbar, btn);
+        gtk_notebook_remove_page(w->notebook, n);
+        w->num_tabs -= 1;
     }
     g_object_unref(view);
     return G_SOURCE_REMOVE;
@@ -501,16 +554,25 @@ static gboolean close_blank_download_tab(gpointer data)
 
 static void on_download_started(WebKitNetworkSession* session, WebKitDownload* download, gpointer data)
 {
+    WebKitWebView* view = webkit_download_get_web_view(download);
+    /* Report it in the window that asked for it; a download with no view of its
+     * own (rare, but possible) falls back to whichever window is focused. */
+    Win* w = win_of(view);
+    if (w == NULL)
+        w = cur();
+    g_object_set_data(G_OBJECT(download), "win", w);
+
     g_signal_connect(download, "decide-destination", G_CALLBACK(on_download_destination), NULL);
     g_signal_connect(download, "notify::estimated-progress", G_CALLBACK(on_download_progress), NULL);
     g_signal_connect(download, "finished", G_CALLBACK(on_download_finished), NULL);
 
     active_downloads += 1;
-    gtk_progress_bar_set_fraction(download_progress, 0.0);
-    gtk_widget_set_visible(GTK_WIDGET(download_progress), TRUE);
-    status_flash_message("Download started");
+    if (w != NULL) {
+        gtk_progress_bar_set_fraction(w->download_progress, 0.0);
+        gtk_widget_set_visible(GTK_WIDGET(w->download_progress), TRUE);
+        status_flash_message(w, "Download started");
+    }
 
-    WebKitWebView* view = webkit_download_get_web_view(download);
     if (view != NULL)
         g_idle_add(close_blank_download_tab, g_object_ref(view));
 }
@@ -518,12 +580,13 @@ static void on_download_started(WebKitNetworkSession* session, WebKitDownload* d
 /* NULL clears it; ignored for background tabs so they can't hijack the status. */
 static void status_set_link(WebKitWebView* view, const char* uri)
 {
-    if (view != current_view())
+    Win* w = win_of(view);
+    if (w == NULL || view != current_view(w))
         return;
-    g_clear_pointer(&status_link, g_free);
+    g_clear_pointer(&w->status_link, g_free);
     if (uri != NULL && uri[0] != '\0')
-        status_link = g_strdup(uri);
-    update_status();
+        w->status_link = g_strdup(uri);
+    update_status(w);
 }
 
 /* Restyle the page's text selection to a dark-blue wash with white text. Applies
@@ -576,9 +639,10 @@ static const char* LINK_FOCUS_JS =
 static void on_load_progress(GObject* obj, GParamSpec* pspec, gpointer data)
 {
     WebKitWebView* view = WEBKIT_WEB_VIEW(obj);
-    if (view != current_view())
+    Win* w = win_of(view);
+    if (w == NULL || view != current_view(w))
         return;
-    gtk_progress_bar_set_fraction(progress, webkit_web_view_get_estimated_load_progress(view));
+    gtk_progress_bar_set_fraction(w->progress, webkit_web_view_get_estimated_load_progress(view));
 }
 
 static void view_set_dark_chrome(WebKitWebView* view, gboolean dark);
@@ -607,17 +671,18 @@ static void on_load_changed(WebKitWebView* view, WebKitLoadEvent event, gpointer
         session_save_queue(); /* this tab's URL just changed */
     }
 
-    if (view != current_view())
+    Win* w = win_of(view);
+    if (w == NULL || view != current_view(w))
         return;
     if (event == WEBKIT_LOAD_STARTED) {
-        page_loading = TRUE;
+        w->page_loading = TRUE;
         g_object_set_data(G_OBJECT(view), "dead", NULL); /* a load means it's alive again */
         tab_set_asleep(view, FALSE);                     /* and no longer dimmed */
-        gtk_progress_bar_set_fraction(progress, 0.0);
+        gtk_progress_bar_set_fraction(w->progress, 0.0);
     } else if (event == WEBKIT_LOAD_FINISHED) {
-        page_loading = FALSE;
+        w->page_loading = FALSE;
     }
-    update_status();
+    update_status(w);
 }
 
 /* A failed load (DNS failure, TLS error, ...) makes WebKit swap in its built-in
@@ -702,7 +767,7 @@ static void on_web_process_terminated(WebKitWebView* view,
     /* Sleeping must never leave the tab you're looking at blank/dimmed: if WebKit's
      * memory-pressure killer (or a crash) takes the foreground process, reload it
      * right away instead of waiting for the user to navigate back. */
-    if (view == current_view())
+    if (view == current_view(win_of(view)))
         revive_if_dead(view);
 }
 
@@ -778,7 +843,7 @@ static long system_oom_headroom_mb(void)
  * dump every background tab at once so it can't OOM out from under us. */
 static gboolean sleep_sweep(gpointer data)
 {
-    if (notebook == NULL)
+    if (wins == NULL)
         return G_SOURCE_CONTINUE;
 
     double pressure = system_mem_pressure();
@@ -789,25 +854,30 @@ static gboolean sleep_sweep(gpointer data)
         return G_SOURCE_CONTINUE; /* comfortable (or PSI unavailable and swap fine): leave tabs be */
     gboolean critical = oom_floor || pressure >= TAB_SLEEP_PRESSURE_CRITICAL;
 
+    /* One sweep covers every window: the pressure is machine-wide, so the tab worth
+     * sleeping is the least recently used of all of them, not of one window. */
     gint64 now = g_get_monotonic_time() / G_USEC_PER_SEC;
-    GtkWidget* cur = gtk_notebook_get_nth_page(notebook, gtk_notebook_get_current_page(notebook));
     GtkWidget* lru = NULL;
     gint64 lru_time = G_MAXINT64;
-    int n = gtk_notebook_get_n_pages(notebook);
-    for (int i = 0; i < n; i++) {
-        GtkWidget* page = gtk_notebook_get_nth_page(notebook, i);
-        if (page == cur || !tab_sleepable(WEBKIT_WEB_VIEW(page)))
-            continue; /* never sleep the tab you're looking at */
-        if (critical) {
-            sleep_tab(WEBKIT_WEB_VIEW(page)); /* OOM imminent: dump them all */
-            continue;
-        }
-        gint64 last = (gint64)GPOINTER_TO_SIZE(g_object_get_data(G_OBJECT(page), "last-active"));
-        if (now - last < TAB_SLEEP_MIN_AGE_SECONDS)
-            continue; /* just left this tab — keep it warm so switching back is instant */
-        if (last < lru_time) {
-            lru_time = last;
-            lru = page;
+    for (guint iw = 0; iw < wins->len; iw++) {
+        Win* w = wins->pdata[iw];
+        GtkWidget* front = gtk_notebook_get_nth_page(w->notebook, gtk_notebook_get_current_page(w->notebook));
+        int n = gtk_notebook_get_n_pages(w->notebook);
+        for (int i = 0; i < n; i++) {
+            GtkWidget* page = gtk_notebook_get_nth_page(w->notebook, i);
+            if (page == front || !tab_sleepable(WEBKIT_WEB_VIEW(page)))
+                continue; /* never sleep the tab you're looking at */
+            if (critical) {
+                sleep_tab(WEBKIT_WEB_VIEW(page)); /* OOM imminent: dump them all */
+                continue;
+            }
+            gint64 last = (gint64)GPOINTER_TO_SIZE(g_object_get_data(G_OBJECT(page), "last-active"));
+            if (now - last < TAB_SLEEP_MIN_AGE_SECONDS)
+                continue; /* just left this tab — keep it warm so switching back is instant */
+            if (last < lru_time) {
+                lru_time = last;
+                lru = page;
+            }
         }
     }
     if (!critical && lru != NULL)
@@ -819,9 +889,12 @@ static gboolean sleep_sweep(gpointer data)
  * "clicked", so mouse selection feels as instant as the keyboard. */
 static void on_tab_pressed(GtkGestureClick* gesture, int n_press, double x, double y, WebKitWebView* view)
 {
-    int n = gtk_notebook_page_num(notebook, GTK_WIDGET(view));
+    Win* w = win_of(view);
+    if (w == NULL)
+        return;
+    int n = gtk_notebook_page_num(w->notebook, GTK_WIDGET(view));
     if (n >= 0)
-        gtk_notebook_set_current_page(notebook, n);
+        gtk_notebook_set_current_page(w->notebook, n);
     revive_if_dead(view); /* clicking a killed tab reloads it (same page if current) */
     gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
 }
@@ -849,7 +922,8 @@ static void on_switch_page(GtkNotebook* nb, GtkWidget* page, guint n, gpointer d
     if (tearing_down)
         return;
 
-    for (GtkWidget* c = gtk_widget_get_first_child(GTK_WIDGET(tabbar)); c != NULL; c = gtk_widget_get_next_sibling(c))
+    Win* w = data;
+    for (GtkWidget* c = gtk_widget_get_first_child(GTK_WIDGET(w->tabbar)); c != NULL; c = gtk_widget_get_next_sibling(c))
         gtk_widget_remove_css_class(c, "active");
     GtkWidget* btn = g_object_get_data(G_OBJECT(page), "button");
     if (btn != NULL)
@@ -858,25 +932,25 @@ static void on_switch_page(GtkNotebook* nb, GtkWidget* page, guint n, gpointer d
     /* Track most-recently-used order so alt+tab can walk back through it. While a
      * walk is driving the switch itself, leave the order untouched: it's committed
      * only when the user releases Alt (see handle_signal_keyrelease). */
-    if (!alt_switch) {
-        mru_promote(page);
-        alt_walk = -1; /* a genuine switch ends any in-progress walk */
+    if (!w->alt_switch) {
+        mru_promote(w, page);
+        w->alt_walk = -1; /* a genuine switch ends any in-progress walk */
     }
 
     /* Resync the status bar to the now-current tab. */
     WebKitWebView* view = WEBKIT_WEB_VIEW(page);
     tab_touch(view); /* mark active now so the sleep sweep leaves it alone */
-    g_clear_pointer(&status_link, g_free); /* no hover/focus on the new tab yet */
-    page_loading = webkit_web_view_is_loading(view);
-    if (page_loading)
-        gtk_progress_bar_set_fraction(progress, webkit_web_view_get_estimated_load_progress(view));
-    update_status();
+    g_clear_pointer(&w->status_link, g_free); /* no hover/focus on the new tab yet */
+    w->page_loading = webkit_web_view_is_loading(view);
+    if (w->page_loading)
+        gtk_progress_bar_set_fraction(w->progress, webkit_web_view_get_estimated_load_progress(view));
+    update_status(w);
     revive_if_dead(view); /* reload a killed tab when the user switches to it */
 
     /* Re-run the find against the now-current tab so its matches/highlight
      * reflect the page the user is actually looking at. */
-    if (gtk_widget_get_visible(findbar))
-        do_find(gtk_editable_get_text(GTK_EDITABLE(find_entry)));
+    if (gtk_widget_get_visible(w->findbar))
+        do_find(w, gtk_editable_get_text(GTK_EDITABLE(w->find_entry)));
 }
 
 static void on_counted_matches(WebKitFindController* fc, guint count, gpointer data);
@@ -939,7 +1013,8 @@ static gboolean on_decide_policy(WebKitWebView* view, WebKitPolicyDecision* deci
 
     if (webkit_navigation_action_get_mouse_button(a) != 2) /* 2 = middle */
         return FALSE;
-    notebook_create_new_tab(webkit_uri_request_get_uri(webkit_navigation_action_get_request(a)));
+    notebook_create_new_tab(win_of(view), /* beside the tab that was middle-clicked */
+        webkit_uri_request_get_uri(webkit_navigation_action_get_request(a)));
     webkit_policy_decision_ignore(decision);
     return TRUE;
 }
@@ -1046,17 +1121,21 @@ static char* view_host(WebKitWebView* view)
 
 /* Pop and display the next queued permission request in the shared modal, or hide
  * the modal once the queue is drained. */
-static void perm_show_next(void)
+static void perm_show_next(Win* asked_in)
 {
     if (perm_current != NULL)
         return; /* one decision at a time */
     perm_current = g_queue_pop_head(&perm_queue);
     if (perm_current == NULL) {
-        modal_hide();
+        if (asked_in != NULL)
+            modal_hide(asked_in);
         return;
     }
+    /* Each request remembers the window whose page raised it, so the prompt lands
+     * over that page rather than over whichever window happens to be focused. */
+    Win* w = g_object_get_data(G_OBJECT(perm_current), "perm-win");
     const char* msg = g_object_get_data(G_OBJECT(perm_current), "perm-msg");
-    modal_show_permission(msg ? msg : "This site wants access");
+    modal_show_permission(w ? w : cur(), msg ? msg : "This site wants access");
 }
 
 /* Resolve the shown request (Enter=allow, Esc=deny), remember an allow for its key
@@ -1065,6 +1144,7 @@ static void perm_decide(gboolean allow)
 {
     if (perm_current == NULL)
         return;
+    Win* shown_in = g_object_get_data(G_OBJECT(perm_current), "perm-win");
     if (allow) {
         webkit_permission_request_allow(perm_current);
         const char* key = g_object_get_data(G_OBJECT(perm_current), "perm-key");
@@ -1074,7 +1154,7 @@ static void perm_decide(gboolean allow)
         webkit_permission_request_deny(perm_current);
     }
     g_clear_object(&perm_current);
-    perm_show_next(); /* re-shows the modal for the next request, or hides it */
+    perm_show_next(shown_in); /* re-shows the modal for the next request, or hides it */
 }
 
 /* Build the prompt for a request, or return FALSE to leave it at WebKit's default.
@@ -1161,11 +1241,12 @@ static gboolean on_permission_request(WebKitWebView* view,
         return TRUE;
     }
 
+    g_object_set_data(G_OBJECT(request), "perm-win", win_of(view)); /* prompt over the asking page */
     g_object_set_data_full(G_OBJECT(request), "perm-key", key, g_free); /* may be NULL */
     g_object_set_data_full(G_OBJECT(request), "perm-msg", msg, g_free);
 
     g_queue_push_tail(&perm_queue, g_object_ref(request));
-    perm_show_next();
+    perm_show_next(win_of(view));
     return TRUE; /* handled asynchronously: we hold a ref until perm_decide */
 }
 
@@ -1175,7 +1256,7 @@ static gboolean on_permission_request(WebKitWebView* view,
  * activities (and many OAuth popups) report completion back through that opener
  * channel, so a detached popup silently fails to credit. A NULL related view is a
  * normal top-level tab using the shared session/context. */
-static WebKitWebView* append_tab(WebKitWebView* related)
+static WebKitWebView* append_tab(Win* w, WebKitWebView* related)
 {
     WebKitWebView* view = related
         ? g_object_new(WEBKIT_TYPE_WEB_VIEW,
@@ -1188,6 +1269,9 @@ static WebKitWebView* append_tab(WebKitWebView* related)
             "web-context", get_shared_web_context(),
             NULL);
     NULLCHECK(view);
+    /* Every handler below is reached from the view, not from a global, so the tab
+     * keeps pointing at its own window however many are open. */
+    g_object_set_data(G_OBJECT(view), "win", w);
     view_set_dark_chrome(view, TRUE); /* dark until a real page commits (on_load_changed) */
 
     webkit_settings_set_user_agent(get_shared_settings(), "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15");
@@ -1205,7 +1289,7 @@ static WebKitWebView* append_tab(WebKitWebView* related)
     gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(click), GTK_PHASE_CAPTURE);
     g_signal_connect(click, "pressed", G_CALLBACK(on_tab_pressed), view);
     gtk_widget_add_controller(btn, GTK_EVENT_CONTROLLER(click));
-    gtk_box_append(tabbar, btn);
+    gtk_box_append(w->tabbar, btn);
 
     g_signal_connect(view, "create", G_CALLBACK(on_create_tab), NULL);
     g_signal_connect(view, "web-process-terminated", G_CALLBACK(on_web_process_terminated), NULL);
@@ -1246,28 +1330,28 @@ static WebKitWebView* append_tab(WebKitWebView* related)
     /* The selection + (dark-only) default-text stylesheets are installed by
      * view_set_dark_chrome (called above), which re-runs them on every load. */
 
-    int n = gtk_notebook_append_page(notebook, GTK_WIDGET(view), NULL);
-    gtk_notebook_set_current_page(notebook, n);
+    int n = gtk_notebook_append_page(w->notebook, GTK_WIDGET(view), NULL);
+    gtk_notebook_set_current_page(w->notebook, n);
     tab_touch(view); /* seed last-active so the sleep sweep doesn't fire immediately */
-    num_tabs += 1;
+    w->num_tabs += 1;
     session_save_queue(); /* a tab appeared: record it without waiting for the exit */
     return view;
 }
 
 /* The MAX_NUM_TABS limit is only enforced by the ctrl+t shortcut; tabs opened
  * by a page (window.open / target=_blank) or from another app are never blocked. */
-static void notebook_create_new_tab(const char* uri)
+static void notebook_create_new_tab(Win* w, const char* uri)
 {
-    WebKitWebView* view = append_tab(NULL);
+    WebKitWebView* view = append_tab(w, NULL);
     load_uri(view, uri ? uri : "about:blank"); /* about:blank spins up the web process */
 }
 
 /* Restore a tab without loading it: the tab appears dimmed with its URL remembered
  * (the same "dead" state a slept tab uses), and revive_if_dead loads it on first
  * switch. Startup then spawns one web process, not one per saved tab. */
-static void notebook_create_lazy_tab(const char* uri)
+static void notebook_create_lazy_tab(Win* w, const char* uri)
 {
-    WebKitWebView* view = append_tab(NULL);
+    WebKitWebView* view = append_tab(w, NULL);
     g_object_set_data_full(G_OBJECT(view), "reload-uri", g_strdup(uri), g_free);
     g_object_set_data(G_OBJECT(view), "dead", GINT_TO_POINTER(1));
     tab_set_asleep(view, TRUE);
@@ -1279,41 +1363,41 @@ static GtkWidget* on_create_tab(WebKitWebView* self,
     /* Return a real related view so WebKit drives the popup itself, preserving
      * window.opener. The old code stopped the opener and reloaded the URL in a
      * detached tab, which broke Rewards/OAuth completion (see append_tab). */
-    return GTK_WIDGET(append_tab(self));
+    return GTK_WIDGET(append_tab(win_of(self), self));
 }
 
 /* The page's slot in the MRU list, or -1 if it isn't tracked. */
-static int mru_index(GtkWidget* page)
+static int mru_index(Win* w, GtkWidget* page)
 {
-    for (int i = 0; i < mru_len; i++)
-        if (mru[i] == page)
+    for (int i = 0; i < w->mru_len; i++)
+        if (w->mru[i] == page)
             return i;
     return -1;
 }
 
 /* Move (or insert) a page at the front of the MRU list, capped at MRU_HISTORY
  * (the oldest entry falls off the back once it's full). */
-static void mru_promote(GtkWidget* page)
+static void mru_promote(Win* w, GtkWidget* page)
 {
-    int at = mru_index(page);
+    int at = mru_index(w, page);
     if (at < 0)
-        at = (mru_len < MRU_HISTORY) ? mru_len++ : MRU_HISTORY - 1; /* drop the oldest */
+        at = (w->mru_len < MRU_HISTORY) ? w->mru_len++ : MRU_HISTORY - 1; /* drop the oldest */
     for (int i = at; i > 0; i--)
-        mru[i] = mru[i - 1];
-    mru[0] = page;
+        w->mru[i] = w->mru[i - 1];
+    w->mru[0] = page;
 }
 
 /* Drop a page from the MRU list (its tab was closed) so it can't linger as an
  * alt+tab target. Reopening it later (ctrl+shift+t) re-promotes it to the front. */
-static void mru_remove(GtkWidget* page)
+static void mru_remove(Win* w, GtkWidget* page)
 {
-    int at = mru_index(page);
+    int at = mru_index(w, page);
     if (at < 0)
         return;
-    for (int i = at; i < mru_len - 1; i++)
-        mru[i] = mru[i + 1];
-    mru[--mru_len] = NULL;
-    alt_walk = -1; /* the list shifted under any walk in progress; restart it */
+    for (int i = at; i < w->mru_len - 1; i++)
+        w->mru[i] = w->mru[i + 1];
+    w->mru[--w->mru_len] = NULL;
+    w->alt_walk = -1; /* the list shifted under any walk in progress; restart it */
 }
 
 static void push_closed(WebKitWebViewSessionState* st)
@@ -1326,36 +1410,39 @@ static void push_closed(WebKitWebViewSessionState* st)
     closed_tabs[closed_count++] = st;
 }
 
-static void close_current_tab(void)
+static void close_current_tab(Win* w)
 {
-    WebKitWebView* view = current_view();
+    WebKitWebView* view = current_view(w);
     if (view == NULL)
         return;
     push_closed(webkit_web_view_get_session_state(view));
 
-    mru_remove(GTK_WIDGET(view));
+    mru_remove(w, GTK_WIDGET(view));
     GtkWidget* btn = g_object_get_data(G_OBJECT(view), "button");
     if (btn != NULL)
-        gtk_box_remove(tabbar, btn);
-    gtk_notebook_remove_page(notebook, gtk_notebook_get_current_page(notebook));
-    num_tabs -= 1;
-    if (num_tabs <= 0) {    /* no homepage to fall back to: this closes the browser */
-        session_save();     /* 0 tabs left -> clears the saved session */
-        if (resident)
-            window_hide_to_resident();
-        else
-            gtk_window_destroy(window);
+        gtk_box_remove(w->tabbar, btn);
+    gtk_notebook_remove_page(w->notebook, gtk_notebook_get_current_page(w->notebook));
+    w->num_tabs -= 1;
+    if (w->num_tabs <= 0) { /* no homepage to fall back to: this closes the window */
+        if (!w->is_main)
+            window_destroy_scratch(w);
+        else if (resident)
+            window_hide_to_resident(w); /* saves first: 0 tabs clears the session */
+        else {
+            session_save(); /* 0 tabs left -> clears the saved session */
+            gtk_window_destroy(w->window);
+        }
         return;
     }
     session_save_queue();
 }
 
-static void reopen_closed_tab(void)
+static void reopen_closed_tab(Win* w)
 {
     if (closed_count == 0)
         return;
     WebKitWebViewSessionState* st = closed_tabs[--closed_count];
-    WebKitWebView* view = append_tab(NULL);
+    WebKitWebView* view = append_tab(w, NULL);
     webkit_web_view_restore_session_state(view, st);
     WebKitBackForwardList* bf = webkit_web_view_get_back_forward_list(view);
     WebKitBackForwardListItem* item = webkit_back_forward_list_get_current_item(bf);
@@ -1367,17 +1454,20 @@ static void reopen_closed_tab(void)
 }
 
 /* ------------------------------------------------------ session restore */
-/* Persist every open tab's URL to SESSION_FILE so the next cold start can bring
+/* Persist the main window's tabs to SESSION_FILE so the next cold start can bring
  * them back. Called on window close and on SIGTERM (logout / poweroff). With no
  * real tabs open it removes the file, so closing everything starts fresh. */
 static void session_save(void)
 {
-    if (notebook == NULL)
+    /* Only the main window is the session: scratch windows are throwaway by
+     * design, so their tabs must never end up in (or wipe) the saved list. */
+    Win* w = main_win;
+    if (w == NULL || w->notebook == NULL)
         return;
     GString* s = g_string_new(NULL);
-    int n = gtk_notebook_get_n_pages(notebook);
+    int n = gtk_notebook_get_n_pages(w->notebook);
     for (int i = 0; i < n; i++) {
-        WebKitWebView* v = WEBKIT_WEB_VIEW(gtk_notebook_get_nth_page(notebook, i));
+        WebKitWebView* v = WEBKIT_WEB_VIEW(gtk_notebook_get_nth_page(w->notebook, i));
         const char* uri = webkit_web_view_get_uri(v);
         /* A lazily-restored tab the user never switched to has no URI of its own —
          * it was never loaded — so fall back to the URL we're holding for it.
@@ -1413,7 +1503,7 @@ static gboolean session_save_now(gpointer data)
  * disappear across a shutdown. Debounced, so a redirect chain writes once. */
 static void session_save_queue(void)
 {
-    if (tearing_down || notebook == NULL)
+    if (tearing_down || main_win == NULL)
         return;
     if (session_save_source != 0)
         g_source_remove(session_save_source);
@@ -1432,7 +1522,7 @@ static gboolean session_exists(void)
  * one tab was restored. `wake` loads the tab that ends up on screen; a launch that
  * is about to append a tab of its own (a link from another app) passes FALSE, so
  * the restored tabs all stay asleep behind the page the user actually asked for. */
-static gboolean session_restore(gboolean wake)
+static gboolean session_restore(Win* w, gboolean wake)
 {
     char* contents = NULL;
     if (!g_file_get_contents(SESSION_FILE, &contents, NULL, NULL))
@@ -1444,13 +1534,13 @@ static gboolean session_restore(gboolean wake)
     for (char** l = lines; *l != NULL; l++) {
         if ((*l)[0] == '\0')
             continue;
-        notebook_create_lazy_tab(*l);
+        notebook_create_lazy_tab(w, *l);
         any = TRUE;
     }
     g_strfreev(lines);
     /* Every restored tab is lazy; wake only the one on screen (the last appended). */
     if (wake)
-        revive_if_dead(current_view());
+        revive_if_dead(current_view(w));
     return any;
 }
 
@@ -1458,98 +1548,98 @@ static gboolean session_restore(gboolean wake)
 /* modal_results holds modal_entry1, then the persistent calc_label, then the
  * bookmark rows -- so the box's spacing only grows when rows exist. Clear the
  * bookmark rows only, keeping the entry and calc_label in place. */
-static void clear_results(void)
+static void clear_results(Win* w)
 {
     GtkWidget* c;
-    while ((c = gtk_widget_get_last_child(GTK_WIDGET(modal_results))) != GTK_WIDGET(calc_label))
-        gtk_box_remove(modal_results, c);
+    while ((c = gtk_widget_get_last_child(GTK_WIDGET(w->modal_results))) != GTK_WIDGET(w->calc_label))
+        gtk_box_remove(w->modal_results, c);
 }
 
 /* Hide the live calculation result and forget its value. */
-static void calc_clear(void)
+static void calc_clear(Win* w)
 {
-    calc_active = FALSE;
-    calc_result[0] = '\0';
-    gtk_widget_set_visible(GTK_WIDGET(calc_label), FALSE);
+    w->calc_active = FALSE;
+    w->calc_result[0] = '\0';
+    gtk_widget_set_visible(GTK_WIDGET(w->calc_label), FALSE);
 }
 
-static void modal_hide(void)
+static void modal_hide(Win* w)
 {
-    modal_mode = MODAL_NONE;
-    gtk_widget_set_visible(dim, FALSE);
-    gtk_widget_set_visible(modal_box, FALSE);
-    gtk_entry_set_attributes(modal_entry1, NULL);
-    clear_results();
-    calc_clear();
-    fuzzy_count = 0;
-    fuzzy_sel = -1;
+    w->modal_mode = MODAL_NONE;
+    gtk_widget_set_visible(w->dim, FALSE);
+    gtk_widget_set_visible(w->modal_box, FALSE);
+    gtk_entry_set_attributes(w->modal_entry1, NULL);
+    clear_results(w);
+    calc_clear(w);
+    w->fuzzy_count = 0;
+    w->fuzzy_sel = -1;
 }
 
-static void modal_show(ModalMode mode, gboolean open_new_tab)
+static void modal_show(Win* w, ModalMode mode, gboolean open_new_tab)
 {
-    modal_mode = mode;
-    modal_new_tab = open_new_tab;
-    modal_blocked = FALSE;
-    fuzzy_count = 0;
-    fuzzy_sel = -1;
-    clear_results();
-    calc_clear();
-    gtk_entry_set_attributes(modal_entry1, NULL);
-    gtk_widget_set_visible(GTK_WIDGET(modal_entry1), TRUE);
-    gtk_widget_set_visible(GTK_WIDGET(modal_results), TRUE);
-    gtk_widget_set_visible(GTK_WIDGET(modal_info), FALSE); /* only shown for "Tab limit reached" */
-    gtk_widget_set_halign(GTK_WIDGET(modal_info), GTK_ALIGN_START); /* undo permission-prompt centering */
+    w->modal_mode = mode;
+    w->modal_new_tab = open_new_tab;
+    w->modal_blocked = FALSE;
+    w->fuzzy_count = 0;
+    w->fuzzy_sel = -1;
+    clear_results(w);
+    calc_clear(w);
+    gtk_entry_set_attributes(w->modal_entry1, NULL);
+    gtk_widget_set_visible(GTK_WIDGET(w->modal_entry1), TRUE);
+    gtk_widget_set_visible(GTK_WIDGET(w->modal_results), TRUE);
+    gtk_widget_set_visible(GTK_WIDGET(w->modal_info), FALSE); /* only shown for "Tab limit reached" */
+    gtk_widget_set_halign(GTK_WIDGET(w->modal_info), GTK_ALIGN_START); /* undo permission-prompt centering */
 
     if (mode == MODAL_SEARCH || mode == MODAL_PASSWORD) {
-        gtk_widget_set_visible(GTK_WIDGET(modal_entry2), FALSE);
-        gtk_editable_set_text(GTK_EDITABLE(modal_entry1), "");
+        gtk_widget_set_visible(GTK_WIDGET(w->modal_entry2), FALSE);
+        gtk_editable_set_text(GTK_EDITABLE(w->modal_entry1), "");
     } else { /* MODAL_BOOKMARK */
-        gtk_widget_set_visible(GTK_WIDGET(modal_entry2), TRUE);
-        WebKitWebView* v = current_view();
+        gtk_widget_set_visible(GTK_WIDGET(w->modal_entry2), TRUE);
+        WebKitWebView* v = current_view(w);
         const char* title = v ? webkit_web_view_get_title(v) : NULL;
         const char* uri = v ? webkit_web_view_get_uri(v) : NULL;
-        gtk_editable_set_text(GTK_EDITABLE(modal_entry1), title ? title : "");
-        gtk_editable_set_text(GTK_EDITABLE(modal_entry2), uri ? uri : "");
+        gtk_editable_set_text(GTK_EDITABLE(w->modal_entry1), title ? title : "");
+        gtk_editable_set_text(GTK_EDITABLE(w->modal_entry2), uri ? uri : "");
     }
 
-    gtk_widget_set_visible(dim, TRUE);
-    gtk_widget_set_visible(modal_box, TRUE);
-    gtk_widget_grab_focus(GTK_WIDGET(modal_entry1));
-    gtk_editable_select_region(GTK_EDITABLE(modal_entry1), 0, -1);
+    gtk_widget_set_visible(w->dim, TRUE);
+    gtk_widget_set_visible(w->modal_box, TRUE);
+    gtk_widget_grab_focus(GTK_WIDGET(w->modal_entry1));
+    gtk_editable_select_region(GTK_EDITABLE(w->modal_entry1), 0, -1);
 }
 
 /* Show a confirm-only prompt (no entry, no results) in the shared modal for a
  * permission request: `markup` is the Pango text, Enter allows / Esc denies
  * (handled in handle_signal_keypress). Reuses the search/bookmark dim + box. */
-static void modal_show_permission(const char* markup)
+static void modal_show_permission(Win* w, const char* markup)
 {
-    modal_mode = MODAL_PERMISSION;
-    modal_blocked = FALSE;
-    fuzzy_count = 0;
-    fuzzy_sel = -1;
-    clear_results();
-    calc_clear();
-    gtk_entry_set_attributes(modal_entry1, NULL);
-    gtk_widget_set_visible(GTK_WIDGET(modal_entry1), FALSE);
-    gtk_widget_set_visible(GTK_WIDGET(modal_entry2), FALSE);
-    gtk_widget_set_visible(GTK_WIDGET(modal_results), FALSE);
+    w->modal_mode = MODAL_PERMISSION;
+    w->modal_blocked = FALSE;
+    w->fuzzy_count = 0;
+    w->fuzzy_sel = -1;
+    clear_results(w);
+    calc_clear(w);
+    gtk_entry_set_attributes(w->modal_entry1, NULL);
+    gtk_widget_set_visible(GTK_WIDGET(w->modal_entry1), FALSE);
+    gtk_widget_set_visible(GTK_WIDGET(w->modal_entry2), FALSE);
+    gtk_widget_set_visible(GTK_WIDGET(w->modal_results), FALSE);
 
-    gtk_label_set_markup(modal_info, markup);
-    gtk_label_set_justify(modal_info, GTK_JUSTIFY_CENTER);
-    gtk_widget_set_halign(GTK_WIDGET(modal_info), GTK_ALIGN_CENTER);
-    gtk_widget_set_visible(GTK_WIDGET(modal_info), TRUE);
+    gtk_label_set_markup(w->modal_info, markup);
+    gtk_label_set_justify(w->modal_info, GTK_JUSTIFY_CENTER);
+    gtk_widget_set_halign(GTK_WIDGET(w->modal_info), GTK_ALIGN_CENTER);
+    gtk_widget_set_visible(GTK_WIDGET(w->modal_info), TRUE);
 
-    gtk_widget_set_visible(dim, TRUE);
-    gtk_widget_set_visible(modal_box, TRUE);
+    gtk_widget_set_visible(w->dim, TRUE);
+    gtk_widget_set_visible(w->modal_box, TRUE);
 }
 
-static void modal_restyle_results(void)
+static void modal_restyle_results(Win* w)
 {
     int i = 0;
-    for (GtkWidget* c = gtk_widget_get_next_sibling(GTK_WIDGET(modal_entry1)); c != NULL; c = gtk_widget_get_next_sibling(c)) {
-        if (c == GTK_WIDGET(calc_label))
+    for (GtkWidget* c = gtk_widget_get_next_sibling(GTK_WIDGET(w->modal_entry1)); c != NULL; c = gtk_widget_get_next_sibling(c)) {
+        if (c == GTK_WIDGET(w->calc_label))
             continue; /* the calc result is a label, not a selectable row */
-        if (i == fuzzy_sel)
+        if (i == w->fuzzy_sel)
             gtk_widget_add_css_class(c, "selected");
         else
             gtk_widget_remove_css_class(c, "selected");
@@ -1557,16 +1647,16 @@ static void modal_restyle_results(void)
     }
 }
 
-static void modal_move_sel(int dir)
+static void modal_move_sel(Win* w, int dir)
 {
-    if (fuzzy_count == 0)
+    if (w->fuzzy_count == 0)
         return;
-    fuzzy_sel += dir;
-    if (fuzzy_sel < 0)
-        fuzzy_sel = 0;
-    if (fuzzy_sel >= (int)fuzzy_count)
-        fuzzy_sel = fuzzy_count - 1;
-    modal_restyle_results();
+    w->fuzzy_sel += dir;
+    if (w->fuzzy_sel < 0)
+        w->fuzzy_sel = 0;
+    if (w->fuzzy_sel >= (int)w->fuzzy_count)
+        w->fuzzy_sel = w->fuzzy_count - 1;
+    modal_restyle_results(w);
 }
 
 /* Speculative DNS: as soon as the typed text looks like a host, resolve it so
@@ -1588,25 +1678,26 @@ static void prefetch_host(const char* text)
 }
 
 /* Rebuild the password picker's result rows for the current host + typed filter. */
-static void password_refresh_rows(const char* query)
+static void password_refresh_rows(Win* w, const char* query)
 {
-    clear_results();
-    fuzzy_sel = -1;
-    fuzzy_count = passwords_match(pass_host, query, pass_entries, FUZZY_RESULTS);
-    for (guint i = 0; i < fuzzy_count; i++) {
-        GtkWidget* row = gtk_label_new(pass_entries[i]);
+    clear_results(w);
+    w->fuzzy_sel = -1;
+    w->fuzzy_count = passwords_match(w->pass_host, query, w->pass_entries, FUZZY_RESULTS);
+    for (guint i = 0; i < w->fuzzy_count; i++) {
+        GtkWidget* row = gtk_label_new(w->pass_entries[i]);
         gtk_label_set_xalign(GTK_LABEL(row), 0.0);
-        gtk_box_append(modal_results, row);
+        gtk_box_append(w->modal_results, row);
     }
 }
 
 static void on_search_changed(GtkEditable* editable, gpointer data)
 {
-    if (modal_mode == MODAL_PASSWORD) {
-        password_refresh_rows(gtk_editable_get_text(editable));
+    Win* w = data;
+    if (w->modal_mode == MODAL_PASSWORD) {
+        password_refresh_rows(w, gtk_editable_get_text(editable));
         return;
     }
-    if (modal_mode != MODAL_SEARCH)
+    if (w->modal_mode != MODAL_SEARCH)
         return;
     const char* text = gtk_editable_get_text(editable);
 
@@ -1623,36 +1714,36 @@ static void on_search_changed(GtkEditable* editable, gpointer data)
         fg->end_index = ll;
         pango_attr_list_insert(attrs, fg);
     }
-    gtk_entry_set_attributes(modal_entry1, attrs);
+    gtk_entry_set_attributes(w->modal_entry1, attrs);
     pango_attr_list_unref(attrs);
 
     /* Fuzzy-match bookmarks once 2+ chars are typed and there's no leader. */
-    clear_results();
-    fuzzy_count = 0;
-    fuzzy_sel = -1;
+    clear_results(w);
+    w->fuzzy_count = 0;
+    w->fuzzy_sel = -1;
 
     /* Live calculator: show the result under the box when the text is a valid
      * expression (a cheap synchronous parse -- no blocking). Skip when a
      * shortcut leader is active, since that's a search, not a sum. */
-    calc_clear();
-    if (ll == 0 && calc_eval(text, calc_result, sizeof calc_result)) {
-        char* shown = g_strconcat("= ", calc_result, NULL);
-        gtk_label_set_text(calc_label, shown);
+    calc_clear(w);
+    if (ll == 0 && calc_eval(text, w->calc_result, sizeof w->calc_result)) {
+        char* shown = g_strconcat("= ", w->calc_result, NULL);
+        gtk_label_set_text(w->calc_label, shown);
         g_free(shown);
-        gtk_widget_set_visible(GTK_WIDGET(calc_label), TRUE);
-        calc_active = TRUE;
+        gtk_widget_set_visible(GTK_WIDGET(w->calc_label), TRUE);
+        w->calc_active = TRUE;
     }
 
     if (ll == 0)
         prefetch_host(text); /* warm DNS for a directly-typed host */
     if (ll == 0 && strlen(text) >= 2) {
         const char* names[FUZZY_RESULTS];
-        fuzzy_count = bookmarks_fuzzy(text, names, fuzzy_urls, FUZZY_RESULTS);
-        for (guint i = 0; i < fuzzy_count; i++) {
+        w->fuzzy_count = bookmarks_fuzzy(text, names, w->fuzzy_urls, FUZZY_RESULTS);
+        for (guint i = 0; i < w->fuzzy_count; i++) {
             GtkWidget* row = gtk_label_new(names[i]);
             gtk_label_set_xalign(GTK_LABEL(row), 0.0);
-            gtk_box_append(modal_results, row);
-            prefetch_host(fuzzy_urls[i]); /* warm DNS for matching bookmarks */
+            gtk_box_append(w->modal_results, row);
+            prefetch_host(w->fuzzy_urls[i]); /* warm DNS for matching bookmarks */
         }
     }
 }
@@ -1663,37 +1754,42 @@ static void on_search_changed(GtkEditable* editable, gpointer data)
  * the rest -- the upload happens inside it (see plugins/imagesearch), so there
  * is nothing to wait on here and no progress to show. A clipboard that turns
  * out to be unreadable is reported through the statusbar flash. */
+/* The plugin reports failures through a plain callback with no context, so the
+ * window that asked for the search is remembered here for the length of it. */
+static Win* imagesearch_win = NULL;
+
 static void imagesearch_error(const char* reason)
 {
     char* msg = g_strdup_printf("Image search failed: %s", reason);
-    status_flash_message(msg);
+    status_flash_message(imagesearch_win != NULL ? imagesearch_win : cur(), msg);
     g_free(msg);
 }
 
 /* Returns TRUE when the paste was consumed as an image search. */
-static gboolean modal_try_image_paste(void)
+static gboolean modal_try_image_paste(Win* w)
 {
-    GdkClipboard* clipboard = gtk_widget_get_clipboard(GTK_WIDGET(modal_entry1));
+    GdkClipboard* clipboard = gtk_widget_get_clipboard(GTK_WIDGET(w->modal_entry1));
     if (!imagesearch_clipboard_has_image(clipboard))
         return FALSE; /* an ordinary text paste */
-    if (modal_blocked) { /* tab limit reached: nowhere to put the results */
-        modal_hide();
+    if (w->modal_blocked) { /* tab limit reached: nowhere to put the results */
+        modal_hide(w);
         return TRUE;
     }
-    gboolean want_new_tab = modal_new_tab || current_view() == NULL;
-    modal_hide(); /* before the tab appears, so the results are all that's left */
-    WebKitWebView* target = want_new_tab ? append_tab(NULL) : current_view();
+    gboolean want_new_tab = w->modal_new_tab || current_view(w) == NULL;
+    modal_hide(w); /* before the tab appears, so the results are all that is left */
+    WebKitWebView* target = want_new_tab ? append_tab(w, NULL) : current_view(w);
+    imagesearch_win = w;
     imagesearch_run(clipboard, target, imagesearch_error);
     return TRUE;
 }
 
-static void modal_open_search_uri(const char* uri)
+static void modal_open_search_uri(Win* w, const char* uri)
 {
-    if (modal_new_tab || current_view() == NULL) /* no warm tab yet -> make one */
-        notebook_create_new_tab(uri);
+    if (w->modal_new_tab || current_view(w) == NULL) /* no warm tab yet -> make one */
+        notebook_create_new_tab(w, uri);
     else
-        load_uri(current_view(), uri);
-    modal_hide();
+        load_uri(current_view(w), uri);
+    modal_hide(w);
 }
 
 /* JS injected into the page to fill a login form. `username`/`password` arrive
@@ -1813,61 +1909,63 @@ static void on_password_ready(const char* username, const char* password, gpoint
 
 static void on_modal_activate(GtkEntry* entry, gpointer data)
 {
-    if (modal_blocked) {
-        modal_hide();
+    Win* w = data;
+    if (w->modal_blocked) {
+        modal_hide(w);
         return;
     }
-    if (modal_mode == MODAL_PASSWORD) {
+    if (w->modal_mode == MODAL_PASSWORD) {
         /* Enter fills the highlighted entry, or the top match if none is picked. */
-        int sel = fuzzy_sel >= 0 ? fuzzy_sel : (fuzzy_count > 0 ? 0 : -1);
+        int sel = w->fuzzy_sel >= 0 ? w->fuzzy_sel : (w->fuzzy_count > 0 ? 0 : -1);
         if (sel >= 0) {
-            WebKitWebView* target = pass_target;
-            char* sel_entry = g_strdup(pass_entries[sel]);
-            modal_hide();
+            WebKitWebView* target = w->pass_target;
+            char* sel_entry = g_strdup(w->pass_entries[sel]);
+            modal_hide(w);
             passwords_show_async(sel_entry, on_password_ready, target);
             g_free(sel_entry);
         } else {
-            modal_hide();
+            modal_hide(w);
         }
         return;
     }
-    if (modal_mode == MODAL_SEARCH) {
-        if (fuzzy_sel >= 0) {
-            modal_open_search_uri(fuzzy_urls[fuzzy_sel]);
+    if (w->modal_mode == MODAL_SEARCH) {
+        if (w->fuzzy_sel >= 0) {
+            modal_open_search_uri(w, w->fuzzy_urls[w->fuzzy_sel]);
             return;
         }
         /* No bookmark picked but a calculation is showing: copy the value. */
-        if (calc_active) {
-            gdk_clipboard_set_text(gtk_widget_get_clipboard(GTK_WIDGET(modal_entry1)), calc_result);
-            modal_hide();
+        if (w->calc_active) {
+            gdk_clipboard_set_text(gtk_widget_get_clipboard(GTK_WIDGET(w->modal_entry1)), w->calc_result);
+            modal_hide(w);
             return;
         }
-        modal_open_search_uri(gtk_editable_get_text(GTK_EDITABLE(modal_entry1)));
+        modal_open_search_uri(w, gtk_editable_get_text(GTK_EDITABLE(w->modal_entry1)));
         return;
     }
     /* MODAL_BOOKMARK -- trim both fields so a pasted URL/name with surrounding
      * whitespace is stored clean (and later navigates instead of searching). */
-    char* name = g_strstrip(g_strdup(gtk_editable_get_text(GTK_EDITABLE(modal_entry1))));
-    char* url = g_strstrip(g_strdup(gtk_editable_get_text(GTK_EDITABLE(modal_entry2))));
+    char* name = g_strstrip(g_strdup(gtk_editable_get_text(GTK_EDITABLE(w->modal_entry1))));
+    char* url = g_strstrip(g_strdup(gtk_editable_get_text(GTK_EDITABLE(w->modal_entry2))));
     if (name[0] != '\0' && url[0] != '\0')
         bookmarks_save(BOOKMARKS_DIR, name, url);
     g_free(name);
     g_free(url);
-    modal_hide();
+    modal_hide(w);
 }
 
 /* ------------------------------------------------------------------- find */
-static void update_find_label(void)
+static void update_find_label(Win* w)
 {
-    char* s = g_strdup_printf("%u of %u", find_total ? find_current : 0, find_total);
-    gtk_label_set_text(find_label, s);
+    char* s = g_strdup_printf("%u of %u", w->find_total ? w->find_current : 0, w->find_total);
+    gtk_label_set_text(w->find_label, s);
     g_free(s);
 }
 
 static void on_counted_matches(WebKitFindController* fc, guint count, gpointer data)
 {
-    find_total = count;
-    update_find_label();
+    Win* w = data;
+    w->find_total = count;
+    update_find_label(w);
 }
 
 /* (Re)issue a fresh search on the live DOM. WebKit's search() both re-highlights
@@ -1875,91 +1973,93 @@ static void on_counted_matches(WebKitFindController* fc, guint count, gpointer d
  * calling it on every step keeps results up to date (content revealed since the
  * last search is picked up) without glitching the order -- it's one step, not two.
  * count_matches refreshes the "N of M" total against the same live DOM. */
-static void find_step(WebKitFindOptions dir)
+static void find_step(Win* w, WebKitFindOptions dir)
 {
-    WebKitWebView* v = current_view();
+    WebKitWebView* v = current_view(w);
     if (v == NULL)
         return;
-    const char* text = gtk_editable_get_text(GTK_EDITABLE(find_entry));
+    const char* text = gtk_editable_get_text(GTK_EDITABLE(w->find_entry));
     WebKitFindController* fc = webkit_web_view_get_find_controller(v);
     WebKitFindOptions opts = WEBKIT_FIND_OPTIONS_CASE_INSENSITIVE | WEBKIT_FIND_OPTIONS_WRAP_AROUND | dir;
     if (text[0] == '\0') {
         webkit_find_controller_search_finish(fc);
-        find_total = 0;
-        find_current = 0;
+        w->find_total = 0;
+        w->find_current = 0;
     } else {
         webkit_find_controller_count_matches(fc, text, opts, G_MAXUINT);
         webkit_find_controller_search(fc, text, opts, G_MAXUINT);
-        if (find_total > 0)
-            find_current = (dir & WEBKIT_FIND_OPTIONS_BACKWARDS)
-                ? (find_current + find_total - 2) % find_total + 1
-                : (find_current % find_total) + 1;
+        if (w->find_total > 0)
+            w->find_current = (dir & WEBKIT_FIND_OPTIONS_BACKWARDS)
+                ? (w->find_current + w->find_total - 2) % w->find_total + 1
+                : (w->find_current % w->find_total) + 1;
         else
-            find_current = 1;
+            w->find_current = 1;
     }
-    update_find_label();
+    update_find_label(w);
 }
 
-static void do_find(const char* text)
+static void do_find(Win* w, const char* text)
 {
-    WebKitWebView* v = current_view();
+    WebKitWebView* v = current_view(w);
     if (v == NULL)
         return;
     WebKitFindController* fc = webkit_web_view_get_find_controller(v);
     WebKitFindOptions opts = WEBKIT_FIND_OPTIONS_CASE_INSENSITIVE | WEBKIT_FIND_OPTIONS_WRAP_AROUND;
     if (text[0] == '\0') {
         webkit_find_controller_search_finish(fc);
-        find_total = 0;
-        find_current = 0;
+        w->find_total = 0;
+        w->find_current = 0;
     } else {
         webkit_find_controller_count_matches(fc, text, opts, G_MAXUINT);
         webkit_find_controller_search(fc, text, opts, G_MAXUINT);
-        find_current = 1;
+        w->find_current = 1;
     }
-    update_find_label();
+    update_find_label(w);
 }
 
 static void on_find_changed(GtkEditable* editable, gpointer data)
 {
-    do_find(gtk_editable_get_text(editable));
+    Win* w = data;
+    do_find(w, gtk_editable_get_text(editable));
 }
 
-static void find_next(void)
+static void find_next(Win* w)
 {
-    find_step(WEBKIT_FIND_OPTIONS_NONE);
+    find_step(w, WEBKIT_FIND_OPTIONS_NONE);
 }
 
-static void find_prev(void)
+static void find_prev(Win* w)
 {
-    find_step(WEBKIT_FIND_OPTIONS_BACKWARDS);
+    find_step(w, WEBKIT_FIND_OPTIONS_BACKWARDS);
 }
 
 static void on_find_activate(GtkEntry* entry, gpointer data)
 {
-    find_next(); /* Enter = next; Shift+Enter (handled in keypress) = previous */
+    Win* w = data;
+    find_next(w); /* Enter = next; Shift+Enter (handled in keypress) = previous */
 }
 
-static void find_show(void)
+static void find_show(Win* w)
 {
     /* If the bar is already open, its matches are still highlighted from the
      * previous search -- Ctrl+F must leave them (and the "N of M" position)
      * exactly as they are and only re-focus the box. When reopening a closed
      * bar there are no highlights left (find_hide cleared them), so re-run the
      * search to restore them. */
-    gboolean was_visible = gtk_widget_get_visible(findbar);
-    gtk_widget_set_visible(findbar, TRUE);
-    gtk_widget_grab_focus(GTK_WIDGET(find_entry));
-    gtk_editable_select_region(GTK_EDITABLE(find_entry), 0, -1);
+    gboolean was_visible = gtk_widget_get_visible(w->findbar);
+    gtk_widget_set_visible(w->findbar, TRUE);
+    gtk_widget_grab_focus(GTK_WIDGET(w->find_entry));
+    gtk_editable_select_region(GTK_EDITABLE(w->find_entry), 0, -1);
     if (!was_visible)
-        do_find(gtk_editable_get_text(GTK_EDITABLE(find_entry)));
+        do_find(w, gtk_editable_get_text(GTK_EDITABLE(w->find_entry)));
 }
 
-static void find_hide(void)
+static void find_hide(Win* w)
 {
-    WebKitWebView* v = current_view();
+    WebKitWebView* v = current_view(w);
     if (v != NULL)
         webkit_find_controller_search_finish(webkit_web_view_get_find_controller(v));
-    gtk_widget_set_visible(findbar, FALSE);
+    gtk_widget_set_visible(w->findbar, FALSE);
 }
 
 /* Fetch the page's serialized HTML, then show it as plain text in a new tab. */
@@ -1975,7 +2075,7 @@ static void on_source_ready(GObject* obj, GAsyncResult* res, gpointer data)
     char* html = jsc_value_to_string(val);
     const char* base = webkit_web_view_get_uri(view);
 
-    WebKitWebView* src = append_tab(NULL);
+    WebKitWebView* src = append_tab(win_of(view), NULL);
     GBytes* bytes = g_bytes_new(html, strlen(html));
     webkit_web_view_load_bytes(src, bytes, "text/plain", "utf-8", base);
 
@@ -1985,10 +2085,10 @@ static void on_source_ready(GObject* obj, GAsyncResult* res, gpointer data)
 }
 
 /* ------------------------------------------------------------- shortcuts */
-static void handle_shortcut(func id)
+static void handle_shortcut(Win* w, func id)
 {
     static double zoom = 1.0;
-    WebKitWebView* view = current_view();
+    WebKitWebView* view = current_view(w);
 
     switch (id) {
         case goback:
@@ -2013,36 +2113,36 @@ static void handle_shortcut(func id)
             if (view) webkit_web_view_set_zoom_level(view, (zoom = 1.0));
             break;
         case tab_up: { /* up the list; do nothing if already at the top */
-            int k = gtk_notebook_get_current_page(notebook);
+            int k = gtk_notebook_get_current_page(w->notebook);
             if (k > 0)
-                gtk_notebook_set_current_page(notebook, k - 1);
+                gtk_notebook_set_current_page(w->notebook, k - 1);
             break;
         }
         case tab_down: { /* down the list; do nothing if already at the bottom */
-            int n = gtk_notebook_get_n_pages(notebook);
-            int k = gtk_notebook_get_current_page(notebook);
+            int n = gtk_notebook_get_n_pages(w->notebook);
+            int k = gtk_notebook_get_current_page(w->notebook);
             if (k < n - 1)
-                gtk_notebook_set_current_page(notebook, k + 1);
+                gtk_notebook_set_current_page(w->notebook, k + 1);
             break;
         }
         case last_tab: { /* alt+tab: walk back through the most-recently-used tabs */
-            if (mru_len < 2)
+            if (w->mru_len < 2)
                 break;
-            if (alt_walk < 0)
-                alt_walk = 0; /* start the walk at the current (front) tab */
+            if (w->alt_walk < 0)
+                w->alt_walk = 0; /* start the walk at the current (front) tab */
             /* Step to the next entry, wrapping, skipping any whose page has gone. */
             int k = -1;
-            for (int tries = 0; tries < mru_len; tries++) {
-                alt_walk = (alt_walk + 1) % mru_len;
-                k = gtk_notebook_page_num(notebook, mru[alt_walk]);
+            for (int tries = 0; tries < w->mru_len; tries++) {
+                w->alt_walk = (w->alt_walk + 1) % w->mru_len;
+                k = gtk_notebook_page_num(w->notebook, w->mru[w->alt_walk]);
                 if (k >= 0)
                     break;
             }
             if (k >= 0) {
-                GtkWidget* target = mru[alt_walk];
-                alt_switch = TRUE; /* don't let this switch reshuffle the MRU order */
-                gtk_notebook_set_current_page(notebook, k);
-                alt_switch = FALSE;
+                GtkWidget* target = w->mru[w->alt_walk];
+                w->alt_switch = TRUE; /* don't let this switch reshuffle the MRU order */
+                gtk_notebook_set_current_page(w->notebook, k);
+                w->alt_switch = FALSE;
                 revive_if_dead(WEBKIT_WEB_VIEW(target)); /* wake it if it was slept */
             }
             break;
@@ -2053,47 +2153,47 @@ static void handle_shortcut(func id)
             const char* cur = view ? webkit_web_view_get_uri(view) : NULL;
             gboolean blank = view && (cur == NULL || cur[0] == '\0'
                                       || g_strcmp0(cur, "about:blank") == 0);
-            modal_show(MODAL_SEARCH, !blank);
-            if (MAX_NUM_TABS != 0 && num_tabs >= MAX_NUM_TABS) {
-                gtk_label_set_text(modal_info, "Tab limit reached");
-                gtk_widget_set_visible(GTK_WIDGET(modal_info), TRUE);
-                gtk_widget_set_visible(GTK_WIDGET(modal_entry1), FALSE); /* message only */
-                gtk_widget_set_visible(GTK_WIDGET(modal_results), FALSE); /* drop the empty box's spacing below the label */
-                modal_blocked = TRUE;
+            modal_show(w, MODAL_SEARCH, !blank);
+            if (MAX_NUM_TABS != 0 && w->num_tabs >= MAX_NUM_TABS) {
+                gtk_label_set_text(w->modal_info, "Tab limit reached");
+                gtk_widget_set_visible(GTK_WIDGET(w->modal_info), TRUE);
+                gtk_widget_set_visible(GTK_WIDGET(w->modal_entry1), FALSE); /* message only */
+                gtk_widget_set_visible(GTK_WIDGET(w->modal_results), FALSE); /* drop the empty box's spacing below the label */
+                w->modal_blocked = TRUE;
             }
             break;
         }
         case close_tab:
-            close_current_tab();
+            close_current_tab(w);
             break;
         case reopen_tab:
-            reopen_closed_tab();
+            reopen_closed_tab(w);
             break;
         case show_finder:
             /* Ctrl+F only opens/focuses the bar and highlights matches; it never
              * moves through results -- only Enter advances to the next match. */
-            find_show();
+            find_show(w);
             break;
         case find_reset:
-            do_find(gtk_editable_get_text(GTK_EDITABLE(find_entry)));
+            do_find(w, gtk_editable_get_text(GTK_EDITABLE(w->find_entry)));
             break;
         case bookmark_add:
-            modal_show(MODAL_BOOKMARK, FALSE);
+            modal_show(w, MODAL_BOOKMARK, FALSE);
             break;
         case edit_uri: {
             /* Open the search modal pre-filled with the current URL; Enter
              * replaces the current tab (modal_new_tab = FALSE). */
-            modal_show(MODAL_SEARCH, FALSE);
+            modal_show(w, MODAL_SEARCH, FALSE);
             const char* uri = view ? webkit_web_view_get_uri(view) : NULL;
             if (uri != NULL) {
-                gtk_editable_set_text(GTK_EDITABLE(modal_entry1), uri);
-                gtk_editable_select_region(GTK_EDITABLE(modal_entry1), 0, -1);
+                gtk_editable_set_text(GTK_EDITABLE(w->modal_entry1), uri);
+                gtk_editable_select_region(GTK_EDITABLE(w->modal_entry1), 0, -1);
             }
             break;
         }
         case toggle_tabs:
-            tabbar_visible = !tabbar_visible;
-            gtk_widget_set_visible(GTK_WIDGET(tabbar), tabbar_visible);
+            w->tabbar_visible = !w->tabbar_visible;
+            gtk_widget_set_visible(GTK_WIDGET(w->tabbar), w->tabbar_visible);
             break;
         case view_source:
             if (view)
@@ -2104,7 +2204,7 @@ static void handle_shortcut(func id)
         case print_page:
             if (view) {
                 WebKitPrintOperation* print = webkit_print_operation_new(view);
-                webkit_print_operation_run_dialog(print, window);
+                webkit_print_operation_run_dialog(print, w->window);
                 g_object_unref(print);
             }
             break;
@@ -2136,20 +2236,20 @@ static void handle_shortcut(func id)
             /* Open the password picker for the current page's host. */
             if (view == NULL)
                 break;
-            pass_host[0] = '\0';
+            w->pass_host[0] = '\0';
             const char* uri = webkit_web_view_get_uri(view);
             if (uri != NULL) {
                 GUri* u = g_uri_parse(uri, G_URI_FLAGS_NONE, NULL);
                 if (u != NULL) {
                     const char* host = g_uri_get_host(u);
                     if (host != NULL)
-                        g_strlcpy(pass_host, host, sizeof pass_host);
+                        g_strlcpy(w->pass_host, host, sizeof w->pass_host);
                     g_uri_unref(u);
                 }
             }
-            pass_target = view;
-            modal_show(MODAL_PASSWORD, FALSE);
-            password_refresh_rows("");
+            w->pass_target = view;
+            modal_show(w, MODAL_PASSWORD, FALSE);
+            password_refresh_rows(w, "");
             break;
         }
     }
@@ -2159,6 +2259,7 @@ static void handle_shortcut(func id)
 static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval,
     guint keycode, GdkModifierType state, gpointer user_data)
 {
+    Win* w = user_data;
     /* A pending permission prompt (mic/camera or storage access) owns the keyboard
      * until it's answered: Enter allows, Esc denies, and every other key is swallowed
      * so nothing acts on the page (or closes the tab) out from under the request. */
@@ -2171,62 +2272,62 @@ static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval
     }
 
     if (keyval == GDK_KEY_Escape) {
-        if (modal_mode != MODAL_NONE) {
-            modal_hide();
+        if (w->modal_mode != MODAL_NONE) {
+            modal_hide(w);
             return TRUE;
         }
-        if (gtk_widget_get_visible(findbar)) {
-            find_hide();
+        if (gtk_widget_get_visible(w->findbar)) {
+            find_hide(w);
             return TRUE;
         }
         return FALSE;
     }
 
     /* Shift+Enter in the find bar steps backwards through matches. */
-    if (gtk_widget_get_visible(findbar) && (state & SFT) && (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter)) {
-        find_prev();
+    if (gtk_widget_get_visible(w->findbar) && (state & SFT) && (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter)) {
+        find_prev(w);
         return TRUE;
     }
 
-    if (modal_mode != MODAL_NONE) {
-        if (modal_mode == MODAL_SEARCH || modal_mode == MODAL_PASSWORD) {
+    if (w->modal_mode != MODAL_NONE) {
+        if (w->modal_mode == MODAL_SEARCH || w->modal_mode == MODAL_PASSWORD) {
             if (keyval == GDK_KEY_Down) {
-                modal_move_sel(1);
+                modal_move_sel(w, 1);
                 return TRUE;
             }
             if (keyval == GDK_KEY_Up) {
-                modal_move_sel(-1);
+                modal_move_sel(w, -1);
                 return TRUE;
             }
         }
-        if (modal_mode == MODAL_SEARCH) {
+        if (w->modal_mode == MODAL_SEARCH) {
             /* Pasting an image (rather than text) reverse-searches it on Google
              * Lens -- there's nothing to type into the entry otherwise. */
             if ((state & CTRL) && (keyval == GDK_KEY_v || keyval == GDK_KEY_V)
-                && modal_try_image_paste())
+                && modal_try_image_paste(w))
                 return TRUE;
             /* Shift+Enter sends a live calculation to Wolfram|Alpha (as if the
              * user typed "wa <expr>"); otherwise it jumps straight to the top
              * fuzzy bookmark match, skipping the typed-text search. */
             if ((state & SFT) && (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter)) {
-                if (calc_active) {
-                    char* tmp = g_strconcat("wa ", gtk_editable_get_text(GTK_EDITABLE(modal_entry1)), NULL);
+                if (w->calc_active) {
+                    char* tmp = g_strconcat("wa ", gtk_editable_get_text(GTK_EDITABLE(w->modal_entry1)), NULL);
                     char* url = shortcut_expand(tmp);
                     g_free(tmp);
                     if (url != NULL) {
-                        modal_open_search_uri(url);
+                        modal_open_search_uri(w, url);
                         g_free(url);
                     }
-                } else if (fuzzy_count > 0) {
-                    modal_open_search_uri(fuzzy_urls[0]);
+                } else if (w->fuzzy_count > 0) {
+                    modal_open_search_uri(w, w->fuzzy_urls[0]);
                 }
                 return TRUE;
             }
         } else if (keyval == GDK_KEY_Tab) {
-            GtkWidget* focus = gtk_window_get_focus(window);
-            gtk_widget_grab_focus(focus == GTK_WIDGET(modal_entry1)
-                    ? GTK_WIDGET(modal_entry2)
-                    : GTK_WIDGET(modal_entry1));
+            GtkWidget* focus = gtk_window_get_focus(w->window);
+            gtk_widget_grab_focus(focus == GTK_WIDGET(w->modal_entry1)
+                    ? GTK_WIDGET(w->modal_entry2)
+                    : GTK_WIDGET(w->modal_entry1));
             return TRUE;
         }
         return FALSE; /* let the entries handle typing; skip global shortcuts */
@@ -2234,7 +2335,7 @@ static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval
 
     for (size_t i = 0; i < sizeof(shortcut) / sizeof(shortcut[0]); i++) {
         if ((state & shortcut[i].mod || shortcut[i].mod == 0x0) && keyval == shortcut[i].key) {
-            handle_shortcut(shortcut[i].id);
+            handle_shortcut(w, shortcut[i].id);
             return TRUE;
         }
     }
@@ -2246,12 +2347,13 @@ static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval
  * presses step deeper into history rather than just toggling the top two. */
 static void handle_signal_keyrelease(GtkEventControllerKey* self G_GNUC_UNUSED,
     guint keyval, guint keycode G_GNUC_UNUSED, GdkModifierType state G_GNUC_UNUSED,
-    gpointer user_data G_GNUC_UNUSED)
+    gpointer user_data)
 {
+    Win* w = user_data;
     if ((keyval == GDK_KEY_Alt_L || keyval == GDK_KEY_Alt_R)
-        && alt_walk > 0 && alt_walk < mru_len) {
-        mru_promote(mru[alt_walk]);
-        alt_walk = -1;
+        && w->alt_walk > 0 && w->alt_walk < w->mru_len) {
+        mru_promote(w, w->mru[w->alt_walk]);
+        w->alt_walk = -1;
     }
 }
 
@@ -2291,64 +2393,64 @@ static void setup_theme(void)
 }
 
 /* ------------------------------------------------------------------ build */
-static void build_modal(void)
+static void build_modal(Win* w)
 {
-    dim = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_widget_add_css_class(dim, "dim");
-    gtk_widget_set_can_target(dim, FALSE);
-    gtk_widget_set_visible(dim, FALSE);
-    gtk_overlay_add_overlay(overlay, dim);
+    w->dim = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_add_css_class(w->dim, "dim");
+    gtk_widget_set_can_target(w->dim, FALSE);
+    gtk_widget_set_visible(w->dim, FALSE);
+    gtk_overlay_add_overlay(w->overlay, w->dim);
 
-    modal_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6); /* gap between name + url entries */
-    gtk_widget_add_css_class(modal_box, "modal");
-    gtk_widget_set_halign(modal_box, GTK_ALIGN_CENTER);
-    gtk_widget_set_valign(modal_box, GTK_ALIGN_CENTER);
-    gtk_widget_set_visible(modal_box, FALSE);
+    w->modal_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6); /* gap between name + url entries */
+    gtk_widget_add_css_class(w->modal_box, "modal");
+    gtk_widget_set_halign(w->modal_box, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(w->modal_box, GTK_ALIGN_CENTER);
+    gtk_widget_set_visible(w->modal_box, FALSE);
 
-    modal_info = GTK_LABEL(gtk_label_new(""));
-    gtk_widget_set_halign(GTK_WIDGET(modal_info), GTK_ALIGN_START);
-    modal_entry1 = GTK_ENTRY(gtk_entry_new());
-    modal_entry2 = GTK_ENTRY(gtk_entry_new());
-    gtk_widget_set_visible(GTK_WIDGET(modal_entry2), FALSE);
+    w->modal_info = GTK_LABEL(gtk_label_new(""));
+    gtk_widget_set_halign(GTK_WIDGET(w->modal_info), GTK_ALIGN_START);
+    w->modal_entry1 = GTK_ENTRY(gtk_entry_new());
+    w->modal_entry2 = GTK_ENTRY(gtk_entry_new());
+    gtk_widget_set_visible(GTK_WIDGET(w->modal_entry2), FALSE);
     /* Entry + bookmark rows share one box (spacing 4) so the gap shows only
      * between present children — no dangling space under the entry when empty. */
-    modal_results = GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL, 4));
-    gtk_box_append(modal_results, GTK_WIDGET(modal_entry1));
+    w->modal_results = GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL, 4));
+    gtk_box_append(w->modal_results, GTK_WIDGET(w->modal_entry1));
     /* Persistent calc-result label, pinned right under the entry and above any
      * bookmark rows. Hidden until the typed text is a valid expression. */
-    calc_label = GTK_LABEL(gtk_label_new(""));
-    gtk_widget_add_css_class(GTK_WIDGET(calc_label), "calc");
-    gtk_label_set_xalign(calc_label, 0.0);
-    gtk_widget_set_visible(GTK_WIDGET(calc_label), FALSE);
-    gtk_box_append(modal_results, GTK_WIDGET(calc_label));
+    w->calc_label = GTK_LABEL(gtk_label_new(""));
+    gtk_widget_add_css_class(GTK_WIDGET(w->calc_label), "calc");
+    gtk_label_set_xalign(w->calc_label, 0.0);
+    gtk_widget_set_visible(GTK_WIDGET(w->calc_label), FALSE);
+    gtk_box_append(w->modal_results, GTK_WIDGET(w->calc_label));
 
-    gtk_box_append(GTK_BOX(modal_box), GTK_WIDGET(modal_info));
-    gtk_box_append(GTK_BOX(modal_box), GTK_WIDGET(modal_results));
-    gtk_box_append(GTK_BOX(modal_box), GTK_WIDGET(modal_entry2));
+    gtk_box_append(GTK_BOX(w->modal_box), GTK_WIDGET(w->modal_info));
+    gtk_box_append(GTK_BOX(w->modal_box), GTK_WIDGET(w->modal_results));
+    gtk_box_append(GTK_BOX(w->modal_box), GTK_WIDGET(w->modal_entry2));
 
-    g_signal_connect(modal_entry1, "changed", G_CALLBACK(on_search_changed), NULL);
-    g_signal_connect(modal_entry1, "activate", G_CALLBACK(on_modal_activate), NULL);
-    g_signal_connect(modal_entry2, "activate", G_CALLBACK(on_modal_activate), NULL);
-    gtk_overlay_add_overlay(overlay, modal_box);
+    g_signal_connect(w->modal_entry1, "changed", G_CALLBACK(on_search_changed), w);
+    g_signal_connect(w->modal_entry1, "activate", G_CALLBACK(on_modal_activate), w);
+    g_signal_connect(w->modal_entry2, "activate", G_CALLBACK(on_modal_activate), w);
+    gtk_overlay_add_overlay(w->overlay, w->modal_box);
 }
 
-static void build_findbar(void)
+static void build_findbar(Win* w)
 {
-    findbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-    gtk_widget_add_css_class(findbar, "findbar");
-    gtk_widget_set_halign(findbar, GTK_ALIGN_CENTER);
-    gtk_widget_set_valign(findbar, GTK_ALIGN_END);
-    gtk_widget_set_visible(findbar, FALSE);
+    w->findbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_widget_add_css_class(w->findbar, "findbar");
+    gtk_widget_set_halign(w->findbar, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(w->findbar, GTK_ALIGN_END);
+    gtk_widget_set_visible(w->findbar, FALSE);
 
-    find_entry = GTK_ENTRY(gtk_entry_new());
-    gtk_entry_set_placeholder_text(find_entry, "Find");
-    find_label = GTK_LABEL(gtk_label_new(""));
-    gtk_box_append(GTK_BOX(findbar), GTK_WIDGET(find_entry));
-    gtk_box_append(GTK_BOX(findbar), GTK_WIDGET(find_label));
+    w->find_entry = GTK_ENTRY(gtk_entry_new());
+    gtk_entry_set_placeholder_text(w->find_entry, "Find");
+    w->find_label = GTK_LABEL(gtk_label_new(""));
+    gtk_box_append(GTK_BOX(w->findbar), GTK_WIDGET(w->find_entry));
+    gtk_box_append(GTK_BOX(w->findbar), GTK_WIDGET(w->find_label));
 
-    g_signal_connect(find_entry, "changed", G_CALLBACK(on_find_changed), NULL);
-    g_signal_connect(find_entry, "activate", G_CALLBACK(on_find_activate), NULL);
-    gtk_overlay_add_overlay(overlay, findbar);
+    g_signal_connect(w->find_entry, "changed", G_CALLBACK(on_find_changed), w);
+    g_signal_connect(w->find_entry, "activate", G_CALLBACK(on_find_activate), w);
+    gtk_overlay_add_overlay(w->overlay, w->findbar);
 }
 
 /* ------------------------------------------------------------ application */
@@ -2361,7 +2463,7 @@ static gboolean shown = FALSE;   /* the window has been presented to the user */
  * realized, exactly as it sat after --prewarm. Reopening therefore costs a map
  * (~5ms) rather than a fresh start, and the tabs come back asleep from the
  * session file, the same as they would have after a real restart. */
-static void window_hide_to_resident(void)
+static void window_hide_to_resident(Win* w)
 {
     session_save();
     if (session_save_source != 0) { /* nothing queued may overwrite it with the teardown */
@@ -2370,34 +2472,59 @@ static void window_hide_to_resident(void)
     }
 
     tearing_down = TRUE;
-    modal_hide();
-    gtk_widget_set_visible(findbar, FALSE);
-    for (int n = gtk_notebook_get_n_pages(notebook); n > 0; n--) {
-        GtkWidget* page = gtk_notebook_get_nth_page(notebook, n - 1);
+    modal_hide(w);
+    gtk_widget_set_visible(w->findbar, FALSE);
+    for (int n = gtk_notebook_get_n_pages(w->notebook); n > 0; n--) {
+        GtkWidget* page = gtk_notebook_get_nth_page(w->notebook, n - 1);
         GtkWidget* btn = g_object_get_data(G_OBJECT(page), "button");
         if (btn != NULL)
-            gtk_box_remove(tabbar, btn);
-        gtk_notebook_remove_page(notebook, n - 1);
+            gtk_box_remove(w->tabbar, btn);
+        gtk_notebook_remove_page(w->notebook, n - 1);
     }
     tearing_down = FALSE;
 
-    num_tabs = 0;
-    mru_len = 0;
-    alt_walk = -1;
-    page_loading = FALSE;
-    g_clear_pointer(&status_link, g_free);
-    update_status();
+    w->num_tabs = 0;
+    w->mru_len = 0;
+    w->alt_walk = -1;
+    w->page_loading = FALSE;
+    g_clear_pointer(&w->status_link, g_free);
+    update_status(w);
 
-    gtk_widget_set_visible(GTK_WIDGET(window), FALSE);
+    gtk_widget_set_visible(GTK_WIDGET(w->window), FALSE);
     shown = FALSE; /* the next activation restores the session, like a fresh launch */
 }
 
-/* Window manager / sway close (the X): save the open tabs, then allow it —
- * unless we're resident, where closing parks the process instead of ending it. */
-static gboolean on_close_request(GtkWindow* w, gpointer data)
+/* Closing a scratch window really does close it: its tabs were never part of the
+ * session, so there is nothing to save and nothing to come back to. */
+static void window_destroy_scratch(Win* w)
 {
+    tearing_down = TRUE;
+    g_ptr_array_remove_fast(wins, w);
+    /* A view can outlive the window by a turn of the loop (a queued download tidy-up
+     * still holds a reference), so cut its link to the Win before that Win is freed:
+     * win_of() then reports NULL, which every handler already treats as "gone". */
+    for (int n = gtk_notebook_get_n_pages(w->notebook); n > 0; n--)
+        g_object_set_data(G_OBJECT(gtk_notebook_get_nth_page(w->notebook, n - 1)), "win", NULL);
+    gtk_window_destroy(w->window);
+    tearing_down = FALSE;
+    g_clear_pointer(&w->status_link, g_free);
+    g_clear_pointer(&w->status_flash, g_free);
+    if (w->status_flash_source != 0)
+        g_source_remove(w->status_flash_source);
+    g_free(w);
+}
+
+/* Window manager / sway close (the X). The main window in resident mode parks the
+ * process rather than ending it; a scratch window just goes away. */
+static gboolean on_close_request(GtkWindow* window, gpointer data)
+{
+    Win* w = data;
+    if (!w->is_main) {
+        window_destroy_scratch(w);
+        return TRUE; /* handled: we did the destroying ourselves */
+    }
     if (resident) {
-        window_hide_to_resident();
+        window_hide_to_resident(w);
         return TRUE; /* handled: don't let GTK destroy the window */
     }
     session_save();
@@ -2413,13 +2540,14 @@ static gboolean on_term_signal(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
-/* Build the window, UI and one blank tab. Idempotent and runs one-time global
- * init on the first call; later calls (a second `open`/`activate` on the
- * already-running instance) are no-ops. */
-static void ensure_window(void)
+/* One-time, process-wide setup: paths, bookmarks, the stylesheet every window
+ * shares, the theme watcher and the memory sweep. */
+static void app_init_once(void)
 {
-    if (window != NULL)
+    static gboolean done = FALSE;
+    if (done)
         return;
+    done = TRUE;
 
     g_mkdir_with_parents(DATA_DIR, 0700);
     bookmarks_load(BOOKMARKS_DIR);
@@ -2432,72 +2560,108 @@ static void ensure_window(void)
     gtk_style_context_add_provider_for_display(gdk_display_get_default(),
         GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_USER + 1);
 
-    window = GTK_WINDOW(gtk_application_window_new(app));
-    gtk_window_set_default_size(window, 1100, 700); /* initial size only; never a resize limit */
-    g_signal_connect(window, "close-request", G_CALLBACK(on_close_request), NULL);
-
-    notebook = GTK_NOTEBOOK(gtk_notebook_new());
-    gtk_notebook_set_show_tabs(notebook, FALSE);
-    gtk_notebook_set_show_border(notebook, FALSE);
-    gtk_widget_add_css_class(GTK_WIDGET(notebook), "webarea");
-    gtk_widget_set_hexpand(GTK_WIDGET(notebook), TRUE);
-    g_signal_connect(notebook, "switch-page", G_CALLBACK(on_switch_page), NULL);
-
-    tabbar = GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL, 0));
-    gtk_widget_add_css_class(GTK_WIDGET(tabbar), "tabbar");
-    gtk_box_set_spacing(tabbar, 4);
-
-    /* Status label (hugs its text) over a thin progress bar, floated at the bottom
-     * of the webview so only the label's own background shows, not a full-width bar. */
-    status_label = GTK_LABEL(gtk_label_new(""));
-    gtk_label_set_xalign(status_label, 0.0);
-    gtk_label_set_ellipsize(status_label, PANGO_ELLIPSIZE_END);
-    gtk_widget_set_halign(GTK_WIDGET(status_label), GTK_ALIGN_START);
-
-    progress = GTK_PROGRESS_BAR(gtk_progress_bar_new());
-    gtk_widget_add_css_class(GTK_WIDGET(progress), "loadbar");
-
-    download_progress = GTK_PROGRESS_BAR(gtk_progress_bar_new());
-    gtk_widget_add_css_class(GTK_WIDGET(download_progress), "downloadbar");
-    gtk_widget_set_visible(GTK_WIDGET(download_progress), FALSE);
-
-    statusbar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_widget_add_css_class(statusbar, "statusbar");
-    gtk_widget_set_valign(statusbar, GTK_ALIGN_END);
-    gtk_widget_set_can_target(statusbar, FALSE); /* clicks fall through to the page */
-    gtk_widget_set_visible(statusbar, FALSE);
-    gtk_box_append(GTK_BOX(statusbar), GTK_WIDGET(status_label));
-    gtk_box_append(GTK_BOX(statusbar), GTK_WIDGET(progress));
-    gtk_box_append(GTK_BOX(statusbar), GTK_WIDGET(download_progress));
-
-    GtkWidget* content = gtk_overlay_new();
-    gtk_widget_set_hexpand(content, TRUE);
-    gtk_overlay_set_child(GTK_OVERLAY(content), GTK_WIDGET(notebook));
-    gtk_overlay_add_overlay(GTK_OVERLAY(content), statusbar);
-
-    GtkWidget* hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_box_append(GTK_BOX(hbox), GTK_WIDGET(tabbar));
-    gtk_box_append(GTK_BOX(hbox), content);
-
-    overlay = GTK_OVERLAY(gtk_overlay_new());
-    gtk_overlay_set_child(overlay, hbox);
-    gtk_window_set_child(window, GTK_WIDGET(overlay));
-
-    build_modal();
-    build_findbar();
-
-    GtkEventController* keys = gtk_event_controller_key_new();
-    gtk_event_controller_set_propagation_phase(keys, GTK_PHASE_CAPTURE);
-    g_signal_connect(keys, "key-pressed", G_CALLBACK(handle_signal_keypress), NULL);
-    g_signal_connect(keys, "key-released", G_CALLBACK(handle_signal_keyrelease), NULL);
-    gtk_widget_add_controller(GTK_WIDGET(window), keys);
-
     setup_theme();
     /* Sleep idle tabs only under real memory pressure, not when RAM is merely full (see sleep_sweep). */
     g_timeout_add_seconds(TAB_SLEEP_SWEEP_SECONDS, sleep_sweep, NULL);
+}
+
+/* Build a browser window and its chrome. No tab is created: the caller decides
+ * what goes in it (the session, a URL, or nothing at all for a scratch window).
+ * `is_main` marks the one window whose tabs are the saved session. */
+static Win* window_new(gboolean is_main)
+{
+    app_init_once();
+
+    Win* w = g_new0(Win, 1);
+    w->is_main = is_main;
+    w->tabbar_visible = TRUE;
+    w->alt_walk = -1;
+    w->fuzzy_sel = -1;
+    w->modal_mode = MODAL_NONE;
+    if (wins == NULL)
+        wins = g_ptr_array_new();
+    g_ptr_array_add(wins, w);
+    if (is_main)
+        main_win = w;
+
+    w->window = GTK_WINDOW(gtk_application_window_new(app));
+    gtk_window_set_default_size(w->window, 1100, 700); /* initial size only; never a resize limit */
+    /* Callbacks reach their window through the widget they fired on, so several
+     * windows can be open without any of them consulting a global. */
+    g_object_set_data(G_OBJECT(w->window), "win", w);
+    g_signal_connect(w->window, "close-request", G_CALLBACK(on_close_request), w);
+
+    w->notebook = GTK_NOTEBOOK(gtk_notebook_new());
+    gtk_notebook_set_show_tabs(w->notebook, FALSE);
+    gtk_notebook_set_show_border(w->notebook, FALSE);
+    gtk_widget_add_css_class(GTK_WIDGET(w->notebook), "webarea");
+    gtk_widget_set_hexpand(GTK_WIDGET(w->notebook), TRUE);
+    g_signal_connect(w->notebook, "switch-page", G_CALLBACK(on_switch_page), w);
+
+    w->tabbar = GTK_BOX(gtk_box_new(GTK_ORIENTATION_VERTICAL, 0));
+    gtk_widget_add_css_class(GTK_WIDGET(w->tabbar), "tabbar");
+    gtk_box_set_spacing(w->tabbar, 4);
+
+    /* Status label (hugs its text) over a thin progress bar, floated at the bottom
+     * of the webview so only the label's own background shows, not a full-width bar. */
+    w->status_label = GTK_LABEL(gtk_label_new(""));
+    gtk_label_set_xalign(w->status_label, 0.0);
+    gtk_label_set_ellipsize(w->status_label, PANGO_ELLIPSIZE_END);
+    gtk_widget_set_halign(GTK_WIDGET(w->status_label), GTK_ALIGN_START);
+
+    w->progress = GTK_PROGRESS_BAR(gtk_progress_bar_new());
+    gtk_widget_add_css_class(GTK_WIDGET(w->progress), "loadbar");
+
+    w->download_progress = GTK_PROGRESS_BAR(gtk_progress_bar_new());
+    gtk_widget_add_css_class(GTK_WIDGET(w->download_progress), "downloadbar");
+    gtk_widget_set_visible(GTK_WIDGET(w->download_progress), FALSE);
+
+    w->statusbar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_add_css_class(w->statusbar, "statusbar");
+    gtk_widget_set_valign(w->statusbar, GTK_ALIGN_END);
+    gtk_widget_set_can_target(w->statusbar, FALSE); /* clicks fall through to the page */
+    gtk_widget_set_visible(w->statusbar, FALSE);
+    gtk_box_append(GTK_BOX(w->statusbar), GTK_WIDGET(w->status_label));
+    gtk_box_append(GTK_BOX(w->statusbar), GTK_WIDGET(w->progress));
+    gtk_box_append(GTK_BOX(w->statusbar), GTK_WIDGET(w->download_progress));
+
+    GtkWidget* content = gtk_overlay_new();
+    gtk_widget_set_hexpand(content, TRUE);
+    gtk_overlay_set_child(GTK_OVERLAY(content), GTK_WIDGET(w->notebook));
+    gtk_overlay_add_overlay(GTK_OVERLAY(content), w->statusbar);
+
+    GtkWidget* hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_box_append(GTK_BOX(hbox), GTK_WIDGET(w->tabbar));
+    gtk_box_append(GTK_BOX(hbox), content);
+
+    w->overlay = GTK_OVERLAY(gtk_overlay_new());
+    gtk_overlay_set_child(w->overlay, hbox);
+    gtk_window_set_child(w->window, GTK_WIDGET(w->overlay));
+
+    build_modal(w);
+    build_findbar(w);
+
+    GtkEventController* keys = gtk_event_controller_key_new();
+    gtk_event_controller_set_propagation_phase(keys, GTK_PHASE_CAPTURE);
+    g_signal_connect(keys, "key-pressed", G_CALLBACK(handle_signal_keypress), w);
+    g_signal_connect(keys, "key-released", G_CALLBACK(handle_signal_keyrelease), w);
+    gtk_widget_add_controller(GTK_WIDGET(w->window), keys);
+
     /* Neither a tab nor the ad-block store is set up here: everything that touches
      * WebKit is deferred past the first frame (see startup_deferred), so the window
      * is on screen before the slow part of startup even begins. */
+    return w;
+}
+
+/* A scratch window: empty, instant (the engine is already up), and outside the
+ * session — closing it takes its tabs with it. This is what a launch does when
+ * the main window is already on screen. */
+static void window_new_scratch(void)
+{
+    Win* w = window_new(FALSE);
+    gtk_window_present(w->window);
+    notebook_create_new_tab(w, NULL);
+    modal_show(w, MODAL_SEARCH, FALSE); /* land in the search box, like a fresh start */
 }
 
 /* Everything expensive that startup can survive without for one frame: creating a
@@ -2518,66 +2682,75 @@ static gboolean startup_deferred(gpointer data)
      * used to replace the saved tabs with that one page — and now that the session
      * is written as you browse rather than only on the way out, that would throw
      * them away for good a few seconds later. */
-    gboolean restored = session_restore(uris == NULL);
+    Win* w = main_win;
+    gboolean restored = session_restore(w, uris == NULL);
     if (uris != NULL) {
         for (char** u = uris; *u != NULL; u++)
-            notebook_create_new_tab(*u); /* appended last, so it's the tab on screen */
+            notebook_create_new_tab(w, *u); /* appended last, so it's the tab on screen */
         g_strfreev(uris);
     } else if (!restored) { /* nothing to restore: a blank search */
-        if (modal_mode == MODAL_NONE)
-            modal_show(MODAL_SEARCH, FALSE);
-        notebook_create_new_tab(NULL);
+        if (w->modal_mode == MODAL_NONE)
+            modal_show(w, MODAL_SEARCH, FALSE);
+        notebook_create_new_tab(w, NULL);
     }
     return G_SOURCE_REMOVE;
 }
 
-/* First real launch: put the window on screen, then let everything else follow.
- * `uris` (may be NULL) is handed to the deferred phase, which owns it. */
+/* First real launch of the main window: put it on screen, then let everything
+ * else follow. `uris` (may be NULL) is handed to the deferred phase, which owns it. */
 static void startup_show(char** uris)
 {
-    ensure_window(); /* a no-op after --prewarm: the window is already built */
+    if (main_win == NULL)
+        window_new(TRUE); /* not prewarmed: build it now */
     /* Decide on the modal from a bare stat, before presenting, so a launch with no
      * session shows its search box in the very first frame rather than a frame later. */
     if (uris == NULL && !session_exists())
-        modal_show(MODAL_SEARCH, FALSE);
-    gtk_window_present(window);
+        modal_show(main_win, MODAL_SEARCH, FALSE);
+    gtk_window_present(main_win->window);
     shown = TRUE;
     g_idle_add_full(G_PRIORITY_LOW, startup_deferred, uris, NULL);
 }
 
-/* Launched with no URL (or a second plain invocation): show the search modal. */
+/* Launched with no URL, or launched again while we're already running.
+ *
+ * The first launch opens the main window with the saved session. Once that window
+ * is up, launching again means "give me somewhere to browse *now*", so it opens a
+ * scratch window instead: empty, on the workspace you're on (sway maps new windows
+ * there and focuses them, which also sidesteps an app's inability to focus itself),
+ * and outside the session. Closing the main window parks it, so a launch after
+ * that reopens it with your tabs rather than making a scratch window. */
 static void on_activate(GApplication* application, gpointer data)
 {
-    /* --prewarm: build and realize the window without mapping it, so GTK's window
-     * setup and the GSK renderer (together the bulk of a cold launch) are already
-     * paid for. The launch that follows only has to map an existing surface, which
-     * puts the window on screen in ~10ms instead of ~400ms. Nothing else is warmed:
+    /* --prewarm: build and realize the main window without mapping it, so GTK's
+     * window setup and the GSK renderer (together the bulk of a cold launch) are
+     * already paid for. The launch that follows only has to map an existing surface,
+     * which puts it on screen in ~10ms instead of ~400ms. Nothing else is warmed:
      * no tab, and no ad-block filters (loading those costs ~110MB resident, and they
      * are only needed once a page actually loads), so an idle prewarm stays cheap. */
     if (prewarm) {
         prewarm = FALSE; /* one prewarm; any later activation is a real launch */
-        ensure_window();
-        gtk_widget_realize(GTK_WIDGET(window));
+        gtk_widget_realize(GTK_WIDGET(window_new(TRUE)->window));
         return; /* the (hidden) window keeps GtkApplication alive on its own */
     }
 
-    if (shown) { /* already up: just raise it */
-        gtk_window_present(window);
-        return;
-    }
-    startup_show(NULL);
+    if (shown)
+        window_new_scratch();
+    else
+        startup_show(NULL);
 }
 
-/* Launched/activated with URLs (default-browser link handling). No modal. */
+/* Launched/activated with URLs (default-browser link handling): always a tab in
+ * the main window, never a new one — a link from Slack or Discord belongs with
+ * the tabs you keep, and lands instantly because that window is already warm. */
 static void on_open(GApplication* application, GFile** files, gint n_files, const char* hint, gpointer data)
 {
-    if (shown) { /* already up: the engine is warm, so open straight away */
+    if (shown) {
         for (gint i = 0; i < n_files; i++) {
             char* uri = g_file_get_uri(files[i]);
-            notebook_create_new_tab(uri);
+            notebook_create_new_tab(main_win, uri);
             g_free(uri);
         }
-        gtk_window_present(window);
+        gtk_window_present(main_win->window);
         return;
     }
 
