@@ -29,6 +29,7 @@
 #define DATA_DIR "/home/alec/.config/lightbrowse"
 #define BOOKMARKS_DIR DATA_DIR "/bookmarks"
 #define SESSION_FILE DATA_DIR "/session" // open tab URLs, restored on next launch
+#define SESSION_SAVE_SECONDS 3 // how long after a navigation the session is written (see session_save_queue)
 #define DOWNLOADS_DIR "/home/alec/Downloads" // saved downloads (assumed to exist)
 
 /* Runtime asset directory.

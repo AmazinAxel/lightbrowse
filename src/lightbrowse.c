@@ -121,8 +121,16 @@ static int closed_count = 0;
 /* System color scheme watcher (the chrome stays dark; only websites follow it). */
 static GSettings* iface_settings = NULL;
 
+/* Resident mode (--prewarm): closing the window hides it and frees the tabs
+ * instead of quitting, so the process stays warm for the next launch. A plain
+ * launch keeps the old behaviour and exits when its window closes. */
+static gboolean resident = FALSE;
+static gboolean tearing_down = FALSE; /* tabs are being dropped; ignore the churn */
+
 /* Forward declarations */
 static void notebook_create_new_tab(const char* uri);
+static void session_save_queue(void);
+static void window_hide_to_resident(void);
 static WebKitWebView* current_view(void);
 static void do_find(const char* text);
 static void session_save(void);
@@ -596,6 +604,7 @@ static void on_load_changed(WebKitWebView* view, WebKitLoadEvent event, gpointer
         view_set_dark_chrome(view, dark);
         if (!dark)
             view_probe_page_background(view);
+        session_save_queue(); /* this tab's URL just changed */
     }
 
     if (view != current_view())
@@ -834,6 +843,12 @@ static void on_favicon_notify(GObject* view, GParamSpec* pspec, gpointer data)
 
 static void on_switch_page(GtkNotebook* nb, GtkWidget* page, guint n, gpointer data)
 {
+    /* Dropping every tab walks the notebook's selection across the survivors on its
+     * way down; none of that is a real tab switch, and reviving the pages it lands
+     * on would spawn web processes we are in the middle of freeing. */
+    if (tearing_down)
+        return;
+
     for (GtkWidget* c = gtk_widget_get_first_child(GTK_WIDGET(tabbar)); c != NULL; c = gtk_widget_get_next_sibling(c))
         gtk_widget_remove_css_class(c, "active");
     GtkWidget* btn = g_object_get_data(G_OBJECT(page), "button");
@@ -1235,6 +1250,7 @@ static WebKitWebView* append_tab(WebKitWebView* related)
     gtk_notebook_set_current_page(notebook, n);
     tab_touch(view); /* seed last-active so the sleep sweep doesn't fire immediately */
     num_tabs += 1;
+    session_save_queue(); /* a tab appeared: record it without waiting for the exit */
     return view;
 }
 
@@ -1323,10 +1339,15 @@ static void close_current_tab(void)
         gtk_box_remove(tabbar, btn);
     gtk_notebook_remove_page(notebook, gtk_notebook_get_current_page(notebook));
     num_tabs -= 1;
-    if (num_tabs <= 0) { /* no homepage to fall back to: quit */
-        session_save();  /* 0 tabs left -> clears the saved session */
-        gtk_window_destroy(window);
+    if (num_tabs <= 0) {    /* no homepage to fall back to: this closes the browser */
+        session_save();     /* 0 tabs left -> clears the saved session */
+        if (resident)
+            window_hide_to_resident();
+        else
+            gtk_window_destroy(window);
+        return;
     }
+    session_save_queue();
 }
 
 static void reopen_closed_tab(void)
@@ -1376,6 +1397,29 @@ static void session_save(void)
     g_string_free(s, TRUE);
 }
 
+static guint session_save_source = 0;
+
+static gboolean session_save_now(gpointer data)
+{
+    session_save_source = 0;
+    session_save();
+    return G_SOURCE_REMOVE;
+}
+
+/* Save the session shortly after the tabs settle, rather than only on the way out.
+ * Exit-time saving alone loses everything when the compositor goes first: GDK's
+ * Wayland loop `_exit()`s the moment it loses the connection, so neither the
+ * close-request handler nor the SIGTERM handler runs — which is why tabs could
+ * disappear across a shutdown. Debounced, so a redirect chain writes once. */
+static void session_save_queue(void)
+{
+    if (tearing_down || notebook == NULL)
+        return;
+    if (session_save_source != 0)
+        g_source_remove(session_save_source);
+    session_save_source = g_timeout_add_seconds(SESSION_SAVE_SECONDS, session_save_now, NULL);
+}
+
 /* Is there a session to restore? A bare stat, so startup can decide whether to
  * show the search modal *before* the window is presented, without doing any of
  * the actual (WebKit-touching) restore work first. */
@@ -1384,9 +1428,11 @@ static gboolean session_exists(void)
     return g_file_test(SESSION_FILE, G_FILE_TEST_EXISTS);
 }
 
-/* Reload the saved tabs into the freshly-built window (reusing its blank tab for
- * the first URL). Returns TRUE if at least one tab was restored. */
-static gboolean session_restore(void)
+/* Reload the saved tabs into the freshly-built window. Returns TRUE if at least
+ * one tab was restored. `wake` loads the tab that ends up on screen; a launch that
+ * is about to append a tab of its own (a link from another app) passes FALSE, so
+ * the restored tabs all stay asleep behind the page the user actually asked for. */
+static gboolean session_restore(gboolean wake)
 {
     char* contents = NULL;
     if (!g_file_get_contents(SESSION_FILE, &contents, NULL, NULL))
@@ -1403,7 +1449,8 @@ static gboolean session_restore(void)
     }
     g_strfreev(lines);
     /* Every restored tab is lazy; wake only the one on screen (the last appended). */
-    revive_if_dead(current_view());
+    if (wake)
+        revive_if_dead(current_view());
     return any;
 }
 
@@ -2309,9 +2356,50 @@ static GtkApplication* app;
 static gboolean prewarm = FALSE; /* --prewarm: build the window but keep it hidden */
 static gboolean shown = FALSE;   /* the window has been presented to the user */
 
-/* Window manager / sway close (the X): save the open tabs, then allow it. */
+/* Closing the browser in resident mode: save the tabs, drop them so their web
+ * processes hand their memory back, and hide the window — still built and still
+ * realized, exactly as it sat after --prewarm. Reopening therefore costs a map
+ * (~5ms) rather than a fresh start, and the tabs come back asleep from the
+ * session file, the same as they would have after a real restart. */
+static void window_hide_to_resident(void)
+{
+    session_save();
+    if (session_save_source != 0) { /* nothing queued may overwrite it with the teardown */
+        g_source_remove(session_save_source);
+        session_save_source = 0;
+    }
+
+    tearing_down = TRUE;
+    modal_hide();
+    gtk_widget_set_visible(findbar, FALSE);
+    for (int n = gtk_notebook_get_n_pages(notebook); n > 0; n--) {
+        GtkWidget* page = gtk_notebook_get_nth_page(notebook, n - 1);
+        GtkWidget* btn = g_object_get_data(G_OBJECT(page), "button");
+        if (btn != NULL)
+            gtk_box_remove(tabbar, btn);
+        gtk_notebook_remove_page(notebook, n - 1);
+    }
+    tearing_down = FALSE;
+
+    num_tabs = 0;
+    mru_len = 0;
+    alt_walk = -1;
+    page_loading = FALSE;
+    g_clear_pointer(&status_link, g_free);
+    update_status();
+
+    gtk_widget_set_visible(GTK_WIDGET(window), FALSE);
+    shown = FALSE; /* the next activation restores the session, like a fresh launch */
+}
+
+/* Window manager / sway close (the X): save the open tabs, then allow it —
+ * unless we're resident, where closing parks the process instead of ending it. */
 static gboolean on_close_request(GtkWindow* w, gpointer data)
 {
+    if (resident) {
+        window_hide_to_resident();
+        return TRUE; /* handled: don't let GTK destroy the window */
+    }
     session_save();
     return FALSE;
 }
@@ -2426,11 +2514,16 @@ static gboolean startup_deferred(gpointer data)
 #if ADBLOCK_ENABLED
     adblock_content_init(ADBLOCK_FILTERS_DIR, ADBLOCK_STORE_DIR);
 #endif
+    /* The last session comes back whatever opened us. A link clicked in another app
+     * used to replace the saved tabs with that one page — and now that the session
+     * is written as you browse rather than only on the way out, that would throw
+     * them away for good a few seconds later. */
+    gboolean restored = session_restore(uris == NULL);
     if (uris != NULL) {
         for (char** u = uris; *u != NULL; u++)
-            notebook_create_new_tab(*u);
+            notebook_create_new_tab(*u); /* appended last, so it's the tab on screen */
         g_strfreev(uris);
-    } else if (!session_restore()) { /* restore last tabs, else a blank search */
+    } else if (!restored) { /* nothing to restore: a blank search */
         if (modal_mode == MODAL_NONE)
             modal_show(MODAL_SEARCH, FALSE);
         notebook_create_new_tab(NULL);
@@ -2526,8 +2619,20 @@ static gboolean forward_to_running_instance(int argc, char** argv, gboolean prob
         return handled;
     }
 
+    /* Pass on the compositor's activation token, the way GApplication would have.
+     * Without it the running instance asks to be focused with no proof that the
+     * request came from something the user just interacted with, and sway is right
+     * to ignore that — a link clicked in another app would open in a tab behind
+     * whatever window you were looking at. */
     GVariantBuilder platform;
-    g_variant_builder_init(&platform, G_VARIANT_TYPE("a{sv}")); /* no platform data to pass */
+    g_variant_builder_init(&platform, G_VARIANT_TYPE("a{sv}"));
+    const char* token = g_getenv("XDG_ACTIVATION_TOKEN");
+    if (token == NULL || token[0] == '\0')
+        token = g_getenv("DESKTOP_STARTUP_ID"); /* X11 / older launchers */
+    if (token != NULL && token[0] != '\0') {
+        g_variant_builder_add(&platform, "{sv}", "activation-token", g_variant_new_string(token));
+        g_variant_builder_add(&platform, "{sv}", "desktop-startup-id", g_variant_new_string(token));
+    }
 
     const char* method;
     GVariant* args;
@@ -2574,7 +2679,7 @@ int main(int argc, char** argv)
     int keep = 1;
     for (int i = 1; i < argc; i++) {
         if (g_strcmp0(argv[i], "--prewarm") == 0)
-            prewarm = TRUE;
+            prewarm = resident = TRUE; /* prewarmed instances also survive their window */
         else
             argv[keep++] = argv[i];
     }

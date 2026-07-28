@@ -57,9 +57,13 @@ static void upload_free(Upload* up)
 }
 
 /* Hand the tab a document that rebuilds the image, hangs it off a file input via
- * DataTransfer (the one way script may populate one) and submits. It paints the
- * chrome's own background so the moment before the POST navigates away is not a
- * white flash. */
+ * DataTransfer (the one way script may populate one) and submits.
+ *
+ * Nothing here is ever meant to be seen. The form has to be *in* the document to
+ * submit at all, but a file input renders as a "Choose File" widget, so it is
+ * hidden -- display:none has no bearing on whether a control is submitted (only
+ * `disabled` does). The document paints the chrome's own background, leaving the
+ * moment before the POST navigates away indistinguishable from an empty tab. */
 static void submit_form(Upload* up, const char* base64)
 {
     char* html = g_strdup_printf(
@@ -72,6 +76,7 @@ static void submit_form(Upload* up, const char* base64)
         "var f=document.createElement('form');"
         "f.method='POST';f.enctype='multipart/form-data';"
         "f.action='https://lens.google.com/upload';"
+        "f.style.display='none';"
         "var inp=document.createElement('input');"
         "inp.type='file';inp.name='encoded_image';"
         "f.appendChild(inp);document.body.appendChild(f);"
