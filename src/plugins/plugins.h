@@ -4,3 +4,4 @@
 #include "calculator/calculator.h"
 #include "adblock/content_filters.h"
 #include "passwords/passwords.h"
+#include "imagesearch/imagesearch.h"

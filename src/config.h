@@ -59,7 +59,7 @@
     /* Resolve hostnames for in-page links (and honour <link rel=dns-prefetch>) so a
      * click's DNS lookup is already done -- complements the manual hover prefetch.
      * Off by default in WebKitGTK. */ \
-    "enable-dns-prefetching", true, \
+    /* "enable-dns-prefetching", true, */ \
     "default-charset", "utf-8"
 
 /* Web platform features WebKitGTK ships but leaves off by default (they are

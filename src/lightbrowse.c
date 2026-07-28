@@ -73,6 +73,8 @@ static GtkBox* modal_results;
 static GtkLabel* calc_label; /* search: live calculation result, shown under the entry */
 static gboolean calc_active = FALSE; /* a valid calculation is currently displayed */
 static char calc_result[64]; /* its formatted value, for the clipboard */
+static guint imgsearch_gen = 0;         /* bumped on modal_hide to orphan a stale upload */
+static gboolean imgsearch_busy = FALSE; /* a reverse image search is in flight */
 static const char* fuzzy_urls[FUZZY_RESULTS];
 static guint fuzzy_count = 0;
 static int fuzzy_sel = -1;
@@ -1334,6 +1336,14 @@ static void session_save(void)
     g_string_free(s, TRUE);
 }
 
+/* Is there a session to restore? A bare stat, so startup can decide whether to
+ * show the search modal *before* the window is presented, without doing any of
+ * the actual (WebKit-touching) restore work first. */
+static gboolean session_exists(void)
+{
+    return g_file_test(SESSION_FILE, G_FILE_TEST_EXISTS);
+}
+
 /* Reload the saved tabs into the freshly-built window (reusing its blank tab for
  * the first URL). Returns TRUE if at least one tab was restored. */
 static gboolean session_restore(void)
@@ -1379,6 +1389,7 @@ static void calc_clear(void)
 static void modal_hide(void)
 {
     modal_mode = MODAL_NONE;
+    imgsearch_gen++; /* orphan any in-flight reverse image search */
     gtk_widget_set_visible(dim, FALSE);
     gtk_widget_set_visible(modal_box, FALSE);
     gtk_entry_set_attributes(modal_entry1, NULL);
@@ -1558,6 +1569,48 @@ static void on_search_changed(GtkEditable* editable, gpointer data)
             prefetch_host(fuzzy_urls[i]); /* warm DNS for matching bookmarks */
         }
     }
+}
+
+/* ------------------------------------------------- reverse image search */
+/* Ctrl+V in the search modal with an image (and no text) on the clipboard
+ * uploads it to Google Lens and opens the results. The upload is async, so the
+ * modal stays up showing "Searching image..."; imgsearch_gen is bumped on every
+ * modal_hide so a result that lands after the user hit Esc -- or opened a second
+ * search -- is dropped instead of hijacking the window. */
+static void modal_open_search_uri(const char* uri);
+
+static void modal_show_status(const char* markup)
+{
+    gtk_label_set_markup(modal_info, markup);
+    gtk_widget_set_visible(GTK_WIDGET(modal_info), TRUE);
+}
+
+static void on_imagesearch_done(const char* uri, const char* error, gpointer data)
+{
+    imgsearch_busy = FALSE;
+    if (GPOINTER_TO_UINT(data) != imgsearch_gen)
+        return; /* the modal moved on while we were uploading */
+    if (uri == NULL) {
+        char* markup = g_markup_printf_escaped("Image search failed: %s", error ? error : "unknown error");
+        modal_show_status(markup);
+        g_free(markup);
+        return;
+    }
+    modal_open_search_uri(uri);
+}
+
+/* Returns TRUE when the paste was consumed as an image search. */
+static gboolean modal_try_image_paste(void)
+{
+    if (imgsearch_busy)
+        return TRUE; /* one upload at a time; swallow the repeat */
+    GdkClipboard* clipboard = gtk_widget_get_clipboard(GTK_WIDGET(modal_entry1));
+    if (!imagesearch_clipboard_has_image(clipboard))
+        return FALSE; /* an ordinary text paste */
+    imgsearch_busy = TRUE;
+    modal_show_status("Searching image...");
+    imagesearch_from_clipboard(clipboard, on_imagesearch_done, GUINT_TO_POINTER(imgsearch_gen));
+    return TRUE;
 }
 
 static void modal_open_search_uri(const char* uri)
@@ -2073,6 +2126,11 @@ static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval
             }
         }
         if (modal_mode == MODAL_SEARCH) {
+            /* Pasting an image (rather than text) reverse-searches it on Google
+             * Lens -- there's nothing to type into the entry otherwise. */
+            if ((state & CTRL) && (keyval == GDK_KEY_v || keyval == GDK_KEY_V)
+                && modal_try_image_paste())
+                return TRUE;
             /* Shift+Enter sends a live calculation to Wolfram|Alpha (as if the
              * user typed "wa <expr>"); otherwise it jumps straight to the top
              * fuzzy bookmark match, skipping the typed-text search. */
@@ -2318,47 +2376,81 @@ static void ensure_window(void)
     gtk_widget_add_controller(GTK_WIDGET(window), keys);
 
     setup_theme();
-#if ADBLOCK_ENABLED
-    /* Start compiling the ad-block content filters now so they're ready by (or
-     * shortly after) the first navigation. Idempotent — safe on re-activation. */
-    adblock_content_init(ADBLOCK_FILTERS_DIR, ADBLOCK_STORE_DIR);
-#endif
     /* Sleep idle tabs only under real memory pressure, not when RAM is merely full (see sleep_sweep). */
     g_timeout_add_seconds(TAB_SLEEP_SWEEP_SECONDS, sleep_sweep, NULL);
-    /* No tab is created here: the caller paints the window/modal first, then warms
-     * the web process on idle, so the search box appears without waiting on WebKit. */
+    /* Neither a tab nor the ad-block store is set up here: everything that touches
+     * WebKit is deferred past the first frame (see startup_deferred), so the window
+     * is on screen before the slow part of startup even begins. */
 }
 
-/* Spin up the web process once the window/modal has been shown. */
-static gboolean warm_blank_tab(gpointer data)
+/* Everything expensive that startup can survive without for one frame: creating a
+ * WebKitWebView drags in the whole engine (web context, network session, GPU
+ * process), which is by far the longest step of a cold launch, and the ad-block
+ * store does synchronous disk work. Both run from a G_PRIORITY_LOW idle, below
+ * GDK's redraw priority, so GTK has already painted the dark chrome + tab bar by
+ * the time we get here: the window appears immediately and the page fills in.
+ * Ad blocking must be initialised before the first tab exists — a view created
+ * earlier is never registered with the filter store and would go unfiltered. */
+static gboolean startup_deferred(gpointer data)
 {
-    if (notebook != NULL && gtk_notebook_get_n_pages(notebook) == 0)
+    char** uris = data; /* URLs to open (from `open`), or NULL for a plain launch */
+#if ADBLOCK_ENABLED
+    adblock_content_init(ADBLOCK_FILTERS_DIR, ADBLOCK_STORE_DIR);
+#endif
+    if (uris != NULL) {
+        for (char** u = uris; *u != NULL; u++)
+            notebook_create_new_tab(*u);
+        g_strfreev(uris);
+    } else if (!session_restore()) { /* restore last tabs, else a blank search */
+        if (modal_mode == MODAL_NONE)
+            modal_show(MODAL_SEARCH, FALSE);
         notebook_create_new_tab(NULL);
+    }
     return G_SOURCE_REMOVE;
+}
+
+static void startup_defer(char** uris)
+{
+    g_idle_add_full(G_PRIORITY_LOW, startup_deferred, uris, NULL);
 }
 
 /* Launched with no URL (or a second plain invocation): show the search modal. */
 static void on_activate(GApplication* application, gpointer data)
 {
-    gboolean fresh = (window == NULL);
-    ensure_window();
-    if (fresh && !session_restore()) { /* restore last tabs, else a blank search */
-        modal_show(MODAL_SEARCH, FALSE);
-        g_idle_add(warm_blank_tab, NULL); /* paint the modal first, warm WebKit after */
+    if (window != NULL) { /* already running: just raise it */
+        gtk_window_present(window);
+        return;
     }
+    ensure_window();
+    /* Decide on the modal from a bare stat, before presenting, so a launch with no
+     * session shows its search box in the very first frame rather than a frame later. */
+    if (!session_exists())
+        modal_show(MODAL_SEARCH, FALSE);
     gtk_window_present(window);
+    startup_defer(NULL);
 }
 
 /* Launched/activated with URLs (default-browser link handling). No modal. */
 static void on_open(GApplication* application, GFile** files, gint n_files, const char* hint, gpointer data)
 {
+    gboolean fresh = (window == NULL);
     ensure_window();
-    for (gint i = 0; i < n_files; i++) {
-        char* uri = g_file_get_uri(files[i]);
-        notebook_create_new_tab(uri);
-        g_free(uri);
+    if (!fresh) { /* already running: the engine is warm, open straight away */
+        for (gint i = 0; i < n_files; i++) {
+            char* uri = g_file_get_uri(files[i]);
+            notebook_create_new_tab(uri);
+            g_free(uri);
+        }
+        gtk_window_present(window);
+        return;
     }
+
+    GPtrArray* uris = g_ptr_array_new();
+    for (gint i = 0; i < n_files; i++)
+        g_ptr_array_add(uris, g_file_get_uri(files[i]));
+    g_ptr_array_add(uris, NULL);
     gtk_window_present(window);
+    startup_defer((char**)g_ptr_array_free(uris, FALSE));
 }
 
 int main(int argc, char** argv)
