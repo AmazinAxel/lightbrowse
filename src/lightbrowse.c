@@ -537,6 +537,26 @@ static const char* NAVIGATOR_SPOOF_JS =
     "catch(e){try{Object.defineProperty(navigator,'platform',"
     "{get:function(){return 'MacIntel';},configurable:true});}catch(e2){}}";
 
+/* WebKitGTK fires the paste event with an empty DataTransfer for images and video —
+ * the editor pastes them fine, but a site reading e.clipboardData.items sees nothing
+ * and does nothing. navigator.clipboard.read() does return the data (see the clipboard
+ * branch in on_permission_request), so swallow the blank event and re-dispatch one
+ * carrying the real files. Text is unaffected: WebKit populates types for it. */
+static const char* PASTE_SHIM_JS =
+    "(function(){var mine=false;"
+    "document.addEventListener('paste',function(e){"
+    "if(mine||e.clipboardData.types.length)return;"
+    "var target=e.target;e.preventDefault();e.stopImmediatePropagation();"
+    "navigator.clipboard.read().then(async function(items){"
+    "var dt=new DataTransfer();"
+    "for(var item of items)for(var type of item.types)"
+    "if(/^(image|video)\\//.test(type))"
+    "dt.items.add(new File([await item.getType(type)],'pasted.'+type.split('/')[1],{type:type}));"
+    "if(!dt.files.length)return;mine=true;"
+    "target.dispatchEvent(new ClipboardEvent('paste',{clipboardData:dt,bubbles:true,cancelable:true}));"
+    "mine=false;}).catch(function(){});"
+    "},true);})();";
+
 /* Report the focused link (keyboard tabbing) the way hover reports it. */
 static const char* LINK_FOCUS_JS =
     "document.addEventListener('focusin',function(e){"
@@ -1197,6 +1217,12 @@ static WebKitWebView* append_tab(WebKitWebView* related)
         WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
     webkit_user_content_manager_add_script(ucm, nav);
     webkit_user_script_unref(nav);
+
+    /* Make media paste reach page scripts (see PASTE_SHIM_JS). */
+    WebKitUserScript* paste = webkit_user_script_new(PASTE_SHIM_JS,
+        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
+    webkit_user_content_manager_add_script(ucm, paste);
+    webkit_user_script_unref(paste);
 
     /* Attach native ad-block content filters to this tab (adds any that are already
      * compiled, and back-fills the rest as compilation finishes). */
