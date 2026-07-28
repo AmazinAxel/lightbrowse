@@ -13,7 +13,7 @@ SECURITY=-fstack-protector-strong
 
 # Dependencies for WebKitGTK 6 / GTK4
 SRC=src/lightbrowse.c
-DEPS=webkitgtk-6.0 gtk4 libsoup-3.0
+DEPS=webkitgtk-6.0 gtk4
 INCS=`pkg-config --cflags $(DEPS)`
 LIBS=`pkg-config --libs $(DEPS)` -lm
 

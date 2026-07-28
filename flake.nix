@@ -185,7 +185,6 @@
             glib-networking
             gsettings-desktop-schemas # color-scheme (website light/dark follows system)
             gtk4
-            libsoup_3 # the reverse-image-search upload (see plugins/imagesearch)
             webkitgtk_6_0
           ]) ++ gstPlugins;
 
@@ -215,7 +214,7 @@
               # store at runtime.
               gcc -std=c23 -O2 -flto -Wall -Wextra -Wno-unused-parameter -fstack-protector-strong \
                 -DLIGHTBROWSE_SHARE_DIR="\"$out/share/lightbrowse\"" \
-                $(pkg-config --cflags webkitgtk-6.0 gtk4 libsoup-3.0) \
+                $(pkg-config --cflags webkitgtk-6.0 gtk4) \
                 src/plugins/shortcuts/shortcuts.c \
                 src/plugins/readability/readability.c \
                 src/plugins/bookmarks/bookmarks.c \
@@ -226,7 +225,7 @@
                 src/plugins/imagesearch/imagesearch.c \
                 src/lightbrowse.c \
                 -o out/lightbrowse \
-                $(pkg-config --libs webkitgtk-6.0 gtk4 libsoup-3.0) -lm
+                $(pkg-config --libs webkitgtk-6.0 gtk4) -lm
 
               runHook postBuild
             '';

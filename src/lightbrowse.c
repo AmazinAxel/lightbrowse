@@ -73,8 +73,6 @@ static GtkBox* modal_results;
 static GtkLabel* calc_label; /* search: live calculation result, shown under the entry */
 static gboolean calc_active = FALSE; /* a valid calculation is currently displayed */
 static char calc_result[64]; /* its formatted value, for the clipboard */
-static guint imgsearch_gen = 0;         /* bumped on modal_hide to orphan a stale upload */
-static gboolean imgsearch_busy = FALSE; /* a reverse image search is in flight */
 static const char* fuzzy_urls[FUZZY_RESULTS];
 static guint fuzzy_count = 0;
 static int fuzzy_sel = -1;
@@ -1389,7 +1387,6 @@ static void calc_clear(void)
 static void modal_hide(void)
 {
     modal_mode = MODAL_NONE;
-    imgsearch_gen++; /* orphan any in-flight reverse image search */
     gtk_widget_set_visible(dim, FALSE);
     gtk_widget_set_visible(modal_box, FALSE);
     gtk_entry_set_attributes(modal_entry1, NULL);
@@ -1573,43 +1570,31 @@ static void on_search_changed(GtkEditable* editable, gpointer data)
 
 /* ------------------------------------------------- reverse image search */
 /* Ctrl+V in the search modal with an image (and no text) on the clipboard
- * uploads it to Google Lens and opens the results. The upload is async, so the
- * modal stays up showing "Searching image..."; imgsearch_gen is bumped on every
- * modal_hide so a result that lands after the user hit Esc -- or opened a second
- * search -- is dropped instead of hijacking the window. */
-static void modal_open_search_uri(const char* uri);
-
-static void modal_show_status(const char* markup)
+ * reverse-searches it on Google Lens. The modal closes at once and the tab does
+ * the rest -- the upload happens inside it (see plugins/imagesearch), so there
+ * is nothing to wait on here and no progress to show. A clipboard that turns
+ * out to be unreadable is reported through the statusbar flash. */
+static void imagesearch_error(const char* reason)
 {
-    gtk_label_set_markup(modal_info, markup);
-    gtk_widget_set_visible(GTK_WIDGET(modal_info), TRUE);
-}
-
-static void on_imagesearch_done(const char* uri, const char* error, gpointer data)
-{
-    imgsearch_busy = FALSE;
-    if (GPOINTER_TO_UINT(data) != imgsearch_gen)
-        return; /* the modal moved on while we were uploading */
-    if (uri == NULL) {
-        char* markup = g_markup_printf_escaped("Image search failed: %s", error ? error : "unknown error");
-        modal_show_status(markup);
-        g_free(markup);
-        return;
-    }
-    modal_open_search_uri(uri);
+    char* msg = g_strdup_printf("Image search failed: %s", reason);
+    status_flash_message(msg);
+    g_free(msg);
 }
 
 /* Returns TRUE when the paste was consumed as an image search. */
 static gboolean modal_try_image_paste(void)
 {
-    if (imgsearch_busy)
-        return TRUE; /* one upload at a time; swallow the repeat */
     GdkClipboard* clipboard = gtk_widget_get_clipboard(GTK_WIDGET(modal_entry1));
     if (!imagesearch_clipboard_has_image(clipboard))
         return FALSE; /* an ordinary text paste */
-    imgsearch_busy = TRUE;
-    modal_show_status("Searching image...");
-    imagesearch_from_clipboard(clipboard, on_imagesearch_done, GUINT_TO_POINTER(imgsearch_gen));
+    if (modal_blocked) { /* tab limit reached: nowhere to put the results */
+        modal_hide();
+        return TRUE;
+    }
+    gboolean want_new_tab = modal_new_tab || current_view() == NULL;
+    modal_hide(); /* before the tab appears, so the results are all that's left */
+    WebKitWebView* target = want_new_tab ? append_tab(NULL) : current_view();
+    imagesearch_run(clipboard, target, imagesearch_error);
     return TRUE;
 }
 

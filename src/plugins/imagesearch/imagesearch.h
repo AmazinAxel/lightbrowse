@@ -1,19 +1,22 @@
 #pragma once
 #include <gdk/gdk.h>
 #include <glib.h>
+#include <webkit/webkit.h>
 
-/* Reverse image search: take an image sitting on the clipboard, upload it to
- * Google Lens, and hand back the results URL to open in a tab. */
+/* Reverse image search: take an image sitting on the clipboard and hand it to
+ * Google Lens in a tab. */
 
-/* Called once the upload finishes. `uri` is the results page on success and
- * NULL on failure, in which case `error` is a short human-readable reason. */
-typedef void (*ImageSearchDone)(const char* uri, const char* error, gpointer user_data);
+/* Called instead of navigating when the clipboard image can't be used at all;
+ * `reason` is a short human-readable message. */
+typedef void (*ImageSearchFailed)(const char* reason);
 
 /* TRUE when the clipboard is offering an image and *not* plain text -- i.e. a
  * paste that has nothing to type into an entry. Synchronous (it only inspects
  * the advertised formats), so it's safe to call from a key handler. */
 gboolean imagesearch_clipboard_has_image(GdkClipboard* clipboard);
 
-/* Read the clipboard image, upload it, and invoke `done` on the main loop.
- * `done` runs exactly once, success or failure. */
-void imagesearch_from_clipboard(GdkClipboard* clipboard, ImageSearchDone done, gpointer user_data);
+/* Reverse-search the clipboard's image in `view`. Returns straight away: the
+ * view first loads a Lens page, then submits the image from inside it and lands
+ * on the results. `on_error` runs only for a clipboard/encoding failure -- once
+ * the navigation is under way, any further trouble is the page's to report. */
+void imagesearch_run(GdkClipboard* clipboard, WebKitWebView* view, ImageSearchFailed on_error);
