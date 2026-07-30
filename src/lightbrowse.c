@@ -82,6 +82,7 @@ typedef struct {
     GtkLabel* modal_info;
     GtkEntry* modal_entry1; /* search text / bookmark name */
     GtkEntry* modal_entry2; /* bookmark url (hidden in search mode) */
+    GtkWidget* modal_focus; /* the modal entry the keyboard belongs to (see modal_keep_focus) */
     GtkBox* modal_results;
     GtkLabel* calc_label;   /* search: live calculation result, shown under the entry */
     gboolean calc_active;   /* a valid calculation is currently displayed */
@@ -160,6 +161,7 @@ static void mru_remove(Win* w, GtkWidget* page);
 static void tab_set_asleep(WebKitWebView* view, gboolean asleep);
 static void modal_show_permission(Win* w, const char* markup);
 static void modal_hide(Win* w);
+static void modal_hide_for_new_tab(Win* w);
 
 /* The window a web view lives in (stashed on the view when its tab is built). */
 static Win* win_of(WebKitWebView* view)
@@ -1013,6 +1015,7 @@ static gboolean on_decide_policy(WebKitWebView* view, WebKitPolicyDecision* deci
 
     if (webkit_navigation_action_get_mouse_button(a) != 2) /* 2 = middle */
         return FALSE;
+    modal_hide_for_new_tab(win_of(view));
     notebook_create_new_tab(win_of(view), /* beside the tab that was middle-clicked */
         webkit_uri_request_get_uri(webkit_navigation_action_get_request(a)));
     webkit_policy_decision_ignore(decision);
@@ -1250,6 +1253,56 @@ static gboolean on_permission_request(WebKitWebView* view,
     return TRUE; /* handled asynchronously: we hold a ref until perm_decide */
 }
 
+/* Silence xdg-desktop-portal's camera dialog, which is not ours and not asked for.
+ *
+ * WebKit's capture code asks the portal for camera access
+ * (org.freedesktop.portal.Camera.AccessCamera) as soon as a page so much as calls
+ * navigator.mediaDevices.enumerateDevices() -- which plenty of sites, claude.ai
+ * among them, do on load just to feature-detect. The portal answers that with a
+ * *system* dialog ("Allow app to Use the Camera?", drawn by
+ * xdg-desktop-portal-gtk), so a page that never wanted the camera puts an OS prompt
+ * on screen. It arrives nowhere near the permission-request signal, so it cannot be
+ * answered in the app; and the portal records the answer per app id in its
+ * permission store, which lives under ~/.local/share/flatpak/db and does not
+ * survive a reboot here -- so the dialog keeps coming back.
+ *
+ * Writing the answer into that store ahead of time is what stops it: the portal
+ * replies from the record and never opens a dialog. The recorded answer is "no",
+ * not "yes", because "no" is the branch that works. Denied, WebKit enumerates and
+ * captures straight off /dev/video* with GStreamer's V4L2 provider -- same camera,
+ * and the getUserMedia request still comes through permission-request, so our own
+ * modal remains the gate (which is where a browser's camera decision belongs).
+ * Granted, WebKit takes the portal's PipeWire route instead, and on this WebKitGTK
+ * (2.52) that route hands the web process a remote it immediately crashes on: the
+ * tab dies and the camera never works at all.
+ *
+ * The camera portal is the only one involved: microphone capture never goes through
+ * it, and screen sharing keeps its portal picker on purpose (see the PipeWire note
+ * in get_shared_web_context) -- handing a page the whole screen is worth a prompt.
+ *
+ * The app id has to be the one WebKit presents to the portal, which is the default
+ * GApplication's -- the same value WebKit itself reads, so it cannot drift. */
+static void camera_portal_answer_in_advance(void)
+{
+    GApplication* application = g_application_get_default();
+    GDBusConnection* bus = application != NULL
+        ? g_application_get_dbus_connection(application) : NULL;
+    const char* app_id = application != NULL
+        ? g_application_get_application_id(application) : NULL;
+    if (bus == NULL || app_id == NULL)
+        return; /* no session bus: no portal asking us anything either */
+
+    /* Rewritten on every launch, not just when unset: an old "yes" (from a dialog
+     * answered before this existed) would otherwise keep the crashing path alive. */
+    const char* answer[] = { "no", NULL };
+    g_dbus_connection_call(bus, "org.freedesktop.impl.portal.PermissionStore",
+        "/org/freedesktop/impl/portal/PermissionStore",
+        "org.freedesktop.impl.portal.PermissionStore", "SetPermission",
+        g_variant_new("(sbss^as)", "devices", TRUE /* create the entry if it's missing */,
+            "camera", app_id, answer),
+        NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL, NULL);
+}
+
 /* When `related` is non-NULL the new view is a popup (window.open / target=_blank):
  * constructing it with "related-view" keeps it in the opener's web process and
  * session and, crucially, preserves window.opener. Microsoft Rewards card
@@ -1363,7 +1416,9 @@ static GtkWidget* on_create_tab(WebKitWebView* self,
     /* Return a real related view so WebKit drives the popup itself, preserving
      * window.opener. The old code stopped the opener and reloaded the URL in a
      * detached tab, which broke Rewards/OAuth completion (see append_tab). */
-    return GTK_WIDGET(append_tab(win_of(self), self));
+    Win* w = win_of(self);
+    modal_hide_for_new_tab(w); /* the popup lands on screen; a stale modal over it doesn't */
+    return GTK_WIDGET(append_tab(w, self));
 }
 
 /* The page's slot in the MRU list, or -1 if it isn't tracked. */
@@ -1565,7 +1620,8 @@ static void calc_clear(Win* w)
 
 static void modal_hide(Win* w)
 {
-    w->modal_mode = MODAL_NONE;
+    w->modal_mode = MODAL_NONE; /* first: it's what stops modal_keep_focus holding on */
+    w->modal_focus = NULL;
     gtk_widget_set_visible(w->dim, FALSE);
     gtk_widget_set_visible(w->modal_box, FALSE);
     gtk_entry_set_attributes(w->modal_entry1, NULL);
@@ -1573,6 +1629,62 @@ static void modal_hide(Win* w)
     calc_clear(w);
     w->fuzzy_count = 0;
     w->fuzzy_sel = -1;
+}
+
+/* A tab that appears from outside the modal's own flow — a link handed to us by
+ * another app, a popup opened by a page — takes over the window, so a search or
+ * bookmark modal left on screen is no longer what the keyboard is for: close it.
+ * A pending permission prompt is deliberately left up: it owns the keyboard until
+ * it's answered, and hiding it would strand the request (perm_current would never
+ * be decided, swallowing every key from then on).
+ *
+ * Only these outside-driven paths hide it, not append_tab itself: startup shows the
+ * search modal *before* the deferred phase creates the first tab, so hiding on every
+ * new tab would take the modal back off a blank launch. */
+static void modal_hide_for_new_tab(Win* w)
+{
+    if (w != NULL && w->modal_mode != MODAL_NONE && w->modal_mode != MODAL_PERMISSION)
+        modal_hide(w);
+}
+
+/* Which modal entry `focus` belongs to, or NULL if it isn't in one. Focus lands on
+ * an entry's inner GtkText rather than the GtkEntry itself (that is what
+ * gtk_window_get_focus reports), so the widget has to be walked up to its entry. */
+static GtkWidget* modal_entry_of(Win* w, GtkWidget* focus)
+{
+    for (GtkWidget* p = focus; p != NULL; p = gtk_widget_get_parent(p)) {
+        if (p == GTK_WIDGET(w->modal_entry1) || p == GTK_WIDGET(w->modal_entry2))
+            return p;
+    }
+    return NULL;
+}
+
+/* While a modal is up the keyboard is its own: anything that takes focus away —
+ * a click landing on the page through the click-through dim, a page calling
+ * focus() as it loads, a new tab handing focus to the notebook — gets it handed
+ * straight back. Without this the modal sits there looking focused while what you
+ * type goes into the page instead.
+ *
+ * Connected to the window's focus-widget, so it only ever moves focus *within* our
+ * window; alt-tabbing away and back is the compositor's business and is untouched.
+ * The permission prompt has nothing focusable (its entries are hidden) and doesn't
+ * need it: its keys are handled on the window in the capture phase. */
+static void modal_keep_focus(GtkWindow* window, GParamSpec* pspec G_GNUC_UNUSED, gpointer data)
+{
+    Win* w = data;
+    if (w->modal_mode == MODAL_NONE || w->modal_mode == MODAL_PERMISSION)
+        return;
+
+    GtkWidget* entry = modal_entry_of(w, gtk_window_get_focus(window));
+    if (entry != NULL) {
+        w->modal_focus = entry; /* remember it, so a Tab to the url entry sticks */
+        return;
+    }
+    /* Re-grabbing emits focus-widget again, but by then focus is on the entry and
+     * the branch above returns — no recursion. */
+    gtk_widget_grab_focus(w->modal_focus != NULL && gtk_widget_get_visible(w->modal_focus)
+            ? w->modal_focus
+            : GTK_WIDGET(w->modal_entry1));
 }
 
 static void modal_show(Win* w, ModalMode mode, gboolean open_new_tab)
@@ -1604,6 +1716,7 @@ static void modal_show(Win* w, ModalMode mode, gboolean open_new_tab)
 
     gtk_widget_set_visible(w->dim, TRUE);
     gtk_widget_set_visible(w->modal_box, TRUE);
+    w->modal_focus = GTK_WIDGET(w->modal_entry1);
     gtk_widget_grab_focus(GTK_WIDGET(w->modal_entry1));
     gtk_editable_select_region(GTK_EDITABLE(w->modal_entry1), 0, -1);
 }
@@ -2324,8 +2437,10 @@ static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval
                 return TRUE;
             }
         } else if (keyval == GDK_KEY_Tab) {
-            GtkWidget* focus = gtk_window_get_focus(w->window);
-            gtk_widget_grab_focus(focus == GTK_WIDGET(w->modal_entry1)
+            /* Toggle between the bookmark name and url entries. Compared through
+             * modal_entry_of because the focus widget is the entry's inner GtkText. */
+            GtkWidget* entry = modal_entry_of(w, gtk_window_get_focus(w->window));
+            gtk_widget_grab_focus(entry == GTK_WIDGET(w->modal_entry1)
                     ? GTK_WIDGET(w->modal_entry2)
                     : GTK_WIDGET(w->modal_entry1));
             return TRUE;
@@ -2640,6 +2755,7 @@ static Win* window_new(gboolean is_main)
 
     build_modal(w);
     build_findbar(w);
+    g_signal_connect(w->window, "notify::focus-widget", G_CALLBACK(modal_keep_focus), w);
 
     GtkEventController* keys = gtk_event_controller_key_new();
     gtk_event_controller_set_propagation_phase(keys, GTK_PHASE_CAPTURE);
@@ -2678,6 +2794,8 @@ static gboolean startup_deferred(gpointer data)
 #if ADBLOCK_ENABLED
     adblock_content_init(ADBLOCK_FILTERS_DIR, ADBLOCK_STORE_DIR);
 #endif
+    /* Before the first page can touch navigator.mediaDevices and set the portal off. */
+    camera_portal_answer_in_advance();
     /* The last session comes back whatever opened us. A link clicked in another app
      * used to replace the saved tabs with that one page — and now that the session
      * is written as you browse rather than only on the way out, that would throw
@@ -2745,6 +2863,7 @@ static void on_activate(GApplication* application, gpointer data)
 static void on_open(GApplication* application, GFile** files, gint n_files, const char* hint, gpointer data)
 {
     if (shown) {
+        modal_hide_for_new_tab(main_win); /* the link is what you want now, not the modal */
         for (gint i = 0; i < n_files; i++) {
             char* uri = g_file_get_uri(files[i]);
             notebook_create_new_tab(main_win, uri);
