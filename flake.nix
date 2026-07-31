@@ -254,6 +254,9 @@
               # on a workspace you cannot see. Nothing is lost by claiming startup
               # notification: the token is consumed by gtk_window_present(), and a
               # compositor simply expires it if we never do.
+              #
+              # application/pdf is claimed because WebKit's bundled PDF.js viewer
+              # renders one in the tab rather than downloading it (see on_decide_policy).
               install -d $out/share/applications
               printf '%s\n' \
                 '[Desktop Entry]' \
@@ -263,7 +266,7 @@
                 'Terminal=false' \
                 'NoDisplay=true' \
                 'StartupNotify=true' \
-                'MimeType=x-scheme-handler/http;x-scheme-handler/https;text/html;' \
+                'MimeType=x-scheme-handler/http;x-scheme-handler/https;text/html;application/pdf;' \
                 > $out/share/applications/com.amazinaxel.lightbrowse.desktop
               runHook postInstall
             '';

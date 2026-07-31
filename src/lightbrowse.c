@@ -2902,6 +2902,47 @@ static void on_open(GApplication* application, GFile** files, gint n_files, cons
 #define APP_ID "com.amazinaxel.lightbrowse"
 #define APP_PATH "/com/amazinaxel/lightbrowse"
 
+/* The activation token the compositor handed our launcher, read back out of the
+ * environment we were exec'd with.
+ *
+ * g_getenv() cannot be used: GDK installs a library constructor
+ * (stash_and_unset_environment) that copies XDG_ACTIVATION_TOKEN and
+ * DESKTOP_STARTUP_ID into private statics and g_unsetenv()s both, so that a token
+ * is never inherited by a child process. Library constructors run before main(),
+ * so by the time any of our code looks, the variables are already gone — and GDK
+ * only ever hands its copy to a display it opens, which this short-lived forwarding
+ * process deliberately never does. unsetenv() edits the process's own environ
+ * array; the kernel's copy of the exec-time environment is untouched, so /proc has
+ * the value GDK erased. */
+static char* launch_activation_token(void)
+{
+    char* env = NULL;
+    gsize len = 0;
+    if (!g_file_get_contents("/proc/self/environ", &env, &len, NULL))
+        return NULL;
+
+    char* token = NULL;
+    char* fallback = NULL; /* DESKTOP_STARTUP_ID: X11 and older launchers */
+    for (gsize i = 0; i < len; i += strlen(env + i) + 1) {
+        const char* entry = env + i;
+        if (token == NULL && g_str_has_prefix(entry, "XDG_ACTIVATION_TOKEN="))
+            token = g_strdup(entry + strlen("XDG_ACTIVATION_TOKEN="));
+        else if (fallback == NULL && g_str_has_prefix(entry, "DESKTOP_STARTUP_ID="))
+            fallback = g_strdup(entry + strlen("DESKTOP_STARTUP_ID="));
+    }
+    g_free(env);
+
+    if (token == NULL || token[0] == '\0') {
+        g_free(token);
+        token = fallback;
+    } else {
+        g_free(fallback);
+    }
+    if (token != NULL && token[0] == '\0')
+        g_clear_pointer(&token, g_free);
+    return token;
+}
+
 /* Raise (or hand URLs to) an instance that is already running, straight over
  * D-Bus. GApplication does this handoff itself, but only after building a
  * GtkApplication and registering it — ~100ms of setup this short-lived process
@@ -2937,12 +2978,13 @@ static gboolean forward_to_running_instance(int argc, char** argv, gboolean prob
      * whatever window you were looking at. */
     GVariantBuilder platform;
     g_variant_builder_init(&platform, G_VARIANT_TYPE("a{sv}"));
-    const char* token = g_getenv("XDG_ACTIVATION_TOKEN");
-    if (token == NULL || token[0] == '\0')
-        token = g_getenv("DESKTOP_STARTUP_ID"); /* X11 / older launchers */
-    if (token != NULL && token[0] != '\0') {
+    char* token = launch_activation_token();
+    if (token != NULL) {
+        /* Both keys: GTK's Wayland backend reads activation-token and falls back to
+         * desktop-startup-id, and the X11 one only knows the latter. */
         g_variant_builder_add(&platform, "{sv}", "activation-token", g_variant_new_string(token));
         g_variant_builder_add(&platform, "{sv}", "desktop-startup-id", g_variant_new_string(token));
+        g_free(token);
     }
 
     const char* method;
