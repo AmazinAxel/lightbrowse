@@ -328,11 +328,19 @@ static WebKitWebContext* get_shared_web_context(void)
          * ScreenCast interface, which hands back a PipeWire node that WebKit reads
          * with GStreamer's pipewiresrc. pipewiresrc still has to connect to the
          * PipeWire *daemon* socket, and WebKit's bubblewrap sandbox binds PulseAudio's
-         * socket into the web process but not PipeWire's -- so the portal negotiates a
-         * stream fine and then no buffers ever arrive, which surfaces as the web
-         * process spamming "gst_buffer_insert_memory: assertion 'mem != NULL' failed"
-         * and a video track that stays black. Bind the socket in explicitly; it must be
-         * writable, as a socket is useless read-only. */
+         * socket into the web process but not PipeWire's -- without this the connection
+         * never comes up and capture dies with "Unable to open pipewire remote. Error:
+         * Timeout was reached". Bind the socket in explicitly; it must be writable, as
+         * a socket is useless read-only.
+         *
+         * Necessary but, on wlroots compositors, not sufficient: xdg-desktop-portal-wlr
+         * leaves buffer->size[plane] at 0 for the DMABuf frames it exports, and
+         * pipewiresrc sizes its GstBuffers from exactly that, so every frame arrives
+         * empty and is dropped -- the web process spams "gst_buffer_insert_memory:
+         * assertion 'mem != NULL' failed" and the shared video stays black. Nothing on
+         * this side can reach that: WebKit pins the capture caps to memory:DMABuf at
+         * build time, so there is no negotiating it down to the shm path that works.
+         * It needs the portal to report the real dmabuf size (lseek on the fd). */
         const char* runtime_dir = g_get_user_runtime_dir();
         if (runtime_dir != NULL) {
             /* PIPEWIRE_REMOTE names the socket when it isn't the default pipewire-0.
@@ -2074,9 +2082,16 @@ static void update_find_label(Win* w)
     g_free(s);
 }
 
+/* The count lands asynchronously, so resolve the window from the controller's own
+ * view rather than trusting anything captured at connect time -- and ignore a count
+ * for a tab that is no longer on screen, whose result would otherwise overwrite the
+ * label with a total the user isn't looking at. */
 static void on_counted_matches(WebKitFindController* fc, guint count, gpointer data)
 {
-    Win* w = data;
+    WebKitWebView* view = webkit_find_controller_get_web_view(fc);
+    Win* w = win_of(view);
+    if (w == NULL || view != current_view(w))
+        return;
     w->find_total = count;
     update_find_label(w);
 }
