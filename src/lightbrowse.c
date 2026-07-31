@@ -140,10 +140,15 @@ static int closed_count = 0;
 /* System color scheme watcher (the chrome stays dark; only websites follow it). */
 static GSettings* iface_settings = NULL;
 
-/* Resident mode (--prewarm): closing the window hides it and frees the tabs
- * instead of quitting, so the process stays warm for the next launch. A plain
- * launch keeps the old behaviour and exits when its window closes. */
-static gboolean resident = FALSE;
+/* Resident mode: closing the browser hides the window and frees the tabs instead of
+ * quitting, so the process stays warm and the next launch is a map rather than a cold
+ * start. Unconditional, and deliberately not tied to --prewarm any more: an instance
+ * started any other way -- a link arriving through the desktop entry, or the launch
+ * key falling back to a cold start because nothing was running -- used to exit when
+ * its window closed. Since the only --prewarm launch is the one at login, losing that
+ * process (a crash, an OOM kill) meant every launch for the rest of the session paid
+ * full startup and then threw the warm process away again on close. */
+static gboolean resident = TRUE;
 static gboolean tearing_down = FALSE; /* tabs are being dropped; ignore the churn */
 
 /* Forward declarations */
@@ -2985,7 +2990,7 @@ int main(int argc, char** argv)
     int keep = 1;
     for (int i = 1; i < argc; i++) {
         if (g_strcmp0(argv[i], "--prewarm") == 0)
-            prewarm = resident = TRUE; /* prewarmed instances also survive their window */
+            prewarm = TRUE; /* residency is unconditional; this only hides the window */
         else
             argv[keep++] = argv[i];
     }
