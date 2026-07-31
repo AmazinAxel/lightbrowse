@@ -605,18 +605,23 @@ static void status_set_link(WebKitWebView* view, const char* uri)
 static const char* SELECTION_CSS =
     "::selection { background-color: #5E81AC !important; color: #FFFFFF !important; }";
 
-/* Our user agent claims macOS Safari (see webkit_settings_set_user_agent), and the
- * whole navigator object already matches real Mac Safari -- except navigator.platform,
- * which WebKit derives from the host OS and reports as "Linux x86_64". That single
- * UA-vs-platform mismatch is a classic bot tell that trips Cloudflare's challenge on
- * nearly every visit. Redefine platform to "MacIntel" at document-start (before any
- * page script reads it) so the fingerprint is internally consistent. Injected into
- * the page's main world so site scripts see the patched value. */
-static const char* NAVIGATOR_SPOOF_JS =
-    "try{Object.defineProperty(Navigator.prototype,'platform',"
-    "{get:function(){return 'MacIntel';},configurable:true});}"
-    "catch(e){try{Object.defineProperty(navigator,'platform',"
-    "{get:function(){return 'MacIntel';},configurable:true});}catch(e2){}}";
+/* navigator.platform is deliberately left alone, and must stay that way.
+ *
+ * It used to be redefined to "MacIntel" at document-start: our user agent claims
+ * macOS Safari (see webkit_settings_set_user_agent) while WebKit derives platform
+ * from the host OS and reports "Linux x86_64", and that UA-vs-platform mismatch is a
+ * classic bot tell that trips Cloudflare's challenge. But navigator.platform is also
+ * exactly what JS editors read to pick their key bindings, and claiming a Mac breaks
+ * every Ctrl shortcut inside them -- not by moving select-all to Cmd+A, but worse:
+ * prosemirror-commands' Mac keymap binds Ctrl+A to selectTextblockStart (the macOS
+ * "go to start of line") and swallows the key, so Ctrl+A in claude.ai's composer
+ * silently did nothing. Ctrl+Z, Ctrl+B and Ctrl+K went the same way. The two uses are
+ * irreconcilable: any value that reads as a Mac to Cloudflare reads as a Mac to
+ * ProseMirror, CodeMirror and Monaco too.
+ *
+ * The user agent alone is not the problem and stays as it is -- the ags sideview sets
+ * the same one, spoofs nothing, and has always handled Ctrl+A correctly. If Cloudflare
+ * challenges come back, fix the fingerprint somewhere that isn't the keyboard. */
 
 /* WebKitGTK fires the paste event with an empty DataTransfer for images and video —
  * the editor pastes them fine, but a site reading e.clipboardData.items sees nothing
@@ -1371,12 +1376,6 @@ static WebKitWebView* append_tab(Win* w, WebKitWebView* related)
         WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
     webkit_user_content_manager_add_script(ucm, script);
     webkit_user_script_unref(script);
-
-    /* Align navigator.platform with the macOS user agent (see NAVIGATOR_SPOOF_JS). */
-    WebKitUserScript* nav = webkit_user_script_new(NAVIGATOR_SPOOF_JS,
-        WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES, WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
-    webkit_user_content_manager_add_script(ucm, nav);
-    webkit_user_script_unref(nav);
 
     /* Make media paste reach page scripts (see PASTE_SHIM_JS). */
     WebKitUserScript* paste = webkit_user_script_new(PASTE_SHIM_JS,
@@ -2384,17 +2383,6 @@ static void handle_shortcut(Win* w, func id)
 }
 
 /* ----------------------------------------------------------------- keys */
-/* Is the find bar's entry what the keyboard is talking to? Focus lands on the
- * entry's inner GtkText, so walk up the way modal_entry_of does. */
-static gboolean find_entry_focused(Win* w)
-{
-    for (GtkWidget* p = gtk_window_get_focus(w->window); p != NULL; p = gtk_widget_get_parent(p)) {
-        if (p == GTK_WIDGET(w->find_entry))
-            return TRUE;
-    }
-    return FALSE;
-}
-
 static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval,
     guint keycode, GdkModifierType state, gpointer user_data)
 {
@@ -2472,27 +2460,6 @@ static gboolean handle_signal_keypress(GtkEventControllerKey* self, guint keyval
             return TRUE;
         }
         return FALSE; /* let the entries handle typing; skip global shortcuts */
-    }
-
-    /* Ctrl+A selects everything. WebKit does this itself in a plain input, but not in
-     * a JS editor: our user agent claims macOS (see NAVIGATOR_SPOOF_JS, which has to
-     * spoof navigator.platform to "MacIntel" to match it), and every editor that reads
-     * navigator.platform then switches to Mac key bindings. ProseMirror -- claude.ai's
-     * composer, among others -- doesn't merely move select-all to Cmd+A there; its Mac
-     * keymap rebinds Ctrl+A to selectTextblockStart, the macOS "go to start of line",
-     * and swallows the key. Nothing the page can be told fixes that, so take the key
-     * before it: the controller runs in the capture phase, ahead of the web view.
-     *
-     * Only when the page has the keyboard. The find bar is a GtkEntry whose own
-     * select-all is already right, and it reaches here because -- unlike the modal --
-     * it doesn't return early above. */
-    if ((state & CTRL) && !(state & ALT) && (keyval == GDK_KEY_a || keyval == GDK_KEY_A)
-        && !find_entry_focused(w)) {
-        WebKitWebView* v = current_view(w);
-        if (v != NULL) {
-            webkit_web_view_execute_editing_command(v, WEBKIT_EDITING_COMMAND_SELECT_ALL);
-            return TRUE;
-        }
     }
 
     for (size_t i = 0; i < sizeof(shortcut) / sizeof(shortcut[0]); i++) {
