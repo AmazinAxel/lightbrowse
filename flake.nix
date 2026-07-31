@@ -244,7 +244,16 @@
               install -Dm644 ${adblockFilters}/version \
                 $out/share/lightbrowse/adblock/version
 
-              # Desktop entry: required so the system can route http(s) links to
+              # Desktop entry: required so the system can route http(s) links to us.
+              #
+              # StartupNotify must stay true. GLib only asks the launching app for an
+              # xdg-activation token when this key is set (gdesktopappinfo.c guards the
+              # whole block on it), and without that token in XDG_ACTIVATION_TOKEN the
+              # running instance has no proof the request came from something the user
+              # just clicked -- so sway refuses to raise us and the link opens in a tab
+              # on a workspace you cannot see. Nothing is lost by claiming startup
+              # notification: the token is consumed by gtk_window_present(), and a
+              # compositor simply expires it if we never do.
               install -d $out/share/applications
               printf '%s\n' \
                 '[Desktop Entry]' \
@@ -253,7 +262,7 @@
                 "Exec=$out/bin/lightbrowse %U" \
                 'Terminal=false' \
                 'NoDisplay=true' \
-                'StartupNotify=false' \
+                'StartupNotify=true' \
                 'MimeType=x-scheme-handler/http;x-scheme-handler/https;text/html;' \
                 > $out/share/applications/com.amazinaxel.lightbrowse.desktop
               runHook postInstall
